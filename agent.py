@@ -2,8 +2,9 @@
 """
 Timing Analysis Agent — CLI interface.
 
-Uses Claude to translate natural language questions into SQL queries
-against a DuckDB database of STA timing paths, then analyzes the results.
+Uses Claude (via Intel GNAI gateway) to translate natural language questions
+into SQL queries against a DuckDB database of STA timing paths, then
+analyzes the results.
 
 Usage:
     python agent.py "top 10 worst setup paths in d2d1"
@@ -12,7 +13,9 @@ Usage:
     python agent.py --block d2d1 --run 26ww14.3 --mode setup "worst paths and suggest fixes"
 
 Environment:
-    ANTHROPIC_API_KEY — required, your Anthropic API key
+    GNAI_API_KEY        — required, your GNAI API key
+    ANTHROPIC_API_KEY   — fallback if GNAI_API_KEY not set (direct Anthropic)
+    INTEL_CERT_BUNDLE   — path to Intel CA bundle (auto-detected if not set)
 """
 
 import argparse
@@ -31,6 +34,18 @@ from config import BLOCKS, DB_PATH
 
 console = Console()
 
+# GNAI gateway configuration
+GNAI_BASE_URL = "https://apis-internal.intel.com/gnai/v1"
+GNAI_MODEL = "anthropic/claude-sonnet-4-20250514"
+DIRECT_MODEL = "claude-sonnet-4-20250514"
+
+# Common cert bundle locations
+CERT_BUNDLE_PATHS = [
+    os.path.expanduser("~/intel-certs/intel-ca-bundle.crt"),
+    "/etc/ssl/certs/ca-certificates.crt",
+    os.environ.get("REQUESTS_CA_BUNDLE", ""),
+    os.environ.get("SSL_CERT_FILE", ""),
+]
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system.txt")
 
 TOOL_SCHEMA = [
@@ -149,7 +164,7 @@ def handle_tool_call(con, tool_name, tool_input):
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
-def run_agent(con, client, question, block=None, run=None, mode=None):
+def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL):
     """Run the agent loop: question → tool calls → analysis."""
 
     # Build the user message with optional context
@@ -169,7 +184,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None):
     # Agent loop — allow multiple tool calls
     for _ in range(10):  # safety limit
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=model,
             max_tokens=4096,
             system=system_prompt,
             tools=TOOL_SCHEMA,
@@ -211,7 +226,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None):
     console.print()
 
 
-def interactive_mode(con, client):
+def interactive_mode(con, client, model=DIRECT_MODEL):
     """Interactive REPL mode."""
     console.print("[bold]Timing Analysis Agent[/bold] — Interactive Mode")
     console.print("Type your question, or 'quit' to exit.\n")
@@ -225,7 +240,7 @@ def interactive_mode(con, client):
         if not question or question.lower() in ("quit", "exit", "q"):
             break
 
-        run_agent(con, client, question)
+        run_agent(con, client, question, model=model)
 
 
 def main():
@@ -238,12 +253,36 @@ def main():
     parser.add_argument("--db", default=DB_PATH, help=f"DuckDB path (default: {DB_PATH})")
     args = parser.parse_args()
 
-    # Check API key
+    # Check API key — prefer GNAI, fallback to direct Anthropic
+    gnai_key = os.environ.get("GNAI_API_KEY")
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        console.print("[red]Error: ANTHROPIC_API_KEY environment variable not set.[/red]")
-        console.print("Set it with: export ANTHROPIC_API_KEY=your-key-here")
+    use_gnai = False
+
+    if gnai_key:
+        api_key = gnai_key
+        use_gnai = True
+    elif not api_key:
+        console.print("[red]Error: No API key found.[/red]")
+        console.print("Set GNAI_API_KEY (Intel GNAI) or ANTHROPIC_API_KEY (direct).")
+        console.print("  csh:  setenv GNAI_API_KEY your-key-here")
+        console.print("  bash: export GNAI_API_KEY=your-key-here")
         sys.exit(1)
+
+    # SSL cert bundle for GNAI
+    if use_gnai:
+        cert_bundle = os.environ.get("INTEL_CERT_BUNDLE")
+        if not cert_bundle:
+            for p in CERT_BUNDLE_PATHS:
+                if p and os.path.isfile(p):
+                    cert_bundle = p
+                    break
+        if cert_bundle and os.path.isfile(cert_bundle):
+            os.environ["REQUESTS_CA_BUNDLE"] = cert_bundle
+            os.environ["SSL_CERT_FILE"] = cert_bundle
+            console.print(f"[dim]Using cert bundle: {cert_bundle}[/dim]")
+        else:
+            console.print("[yellow]Warning: No Intel cert bundle found. SSL errors may occur.[/yellow]")
+            console.print("[yellow]Run: python setup_certs.py   (or set INTEL_CERT_BUNDLE)[/yellow]")
 
     # Connect to DuckDB
     if not os.path.exists(args.db):
@@ -252,13 +291,27 @@ def main():
         sys.exit(1)
 
     con = duckdb.connect(args.db, read_only=True)
-    client = anthropic.Anthropic(api_key=api_key)
+
+    if use_gnai:
+        import httpx
+        http_client = httpx.Client(verify=cert_bundle if cert_bundle else True)
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            base_url=GNAI_BASE_URL,
+            http_client=http_client,
+        )
+        model = GNAI_MODEL
+        console.print("[dim]Using Intel GNAI gateway[/dim]")
+    else:
+        client = anthropic.Anthropic(api_key=api_key)
+        model = DIRECT_MODEL
+        console.print("[dim]Using direct Anthropic API[/dim]")
 
     try:
         if args.interactive:
-            interactive_mode(con, client)
+            interactive_mode(con, client, model)
         elif args.question:
-            run_agent(con, client, args.question, args.block, args.run, args.mode)
+            run_agent(con, client, args.question, args.block, args.run, args.mode, model=model)
         else:
             parser.print_help()
     finally:
