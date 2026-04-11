@@ -35,8 +35,8 @@ from config import BLOCKS, DB_PATH
 console = Console()
 
 # GNAI gateway configuration
-GNAI_BASE_URL = "https://apis-internal.intel.com/gnai/v1"
-GNAI_MODEL = "anthropic/claude-sonnet-4-20250514"
+GNAI_BASE_URL = "https://gnai.intel.com/api/providers/anthropic/v1"
+GNAI_MODEL = "claude-4-5-sonnet"
 DIRECT_MODEL = "claude-sonnet-4-20250514"
 
 # Common cert bundle locations
@@ -296,9 +296,13 @@ def main():
         import httpx
         http_client = httpx.Client(verify=cert_bundle if cert_bundle else True)
         client = anthropic.Anthropic(
-            api_key=api_key,
+            api_key="dummy",  # required by SDK but we override with Bearer
             base_url=GNAI_BASE_URL,
             http_client=http_client,
+            default_headers={
+                "Authorization": f"Bearer {api_key}",
+                "anthropic-version": "2023-06-01",
+            },
         )
         model = GNAI_MODEL
         console.print("[dim]Using Intel GNAI gateway[/dim]")
