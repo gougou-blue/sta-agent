@@ -96,7 +96,16 @@ def ingest_csv(con, block, run_label, csv_path, mode):
 
     print(f"  Ingesting {mode}: {csv_path}")
     start = time.time()
-    rows = []
+    total_rows = 0
+    batch = []
+    BATCH_SIZE = 10000
+
+    INSERT_SQL = """INSERT INTO paths (
+        block, run_label, mode, slack, clock_percentage, period,
+        startpoint, endpoint, launch_clock, capture_clock, path_group,
+        int_ext, int_ext_child, driver_partition, receiver_partition,
+        levels_of_logic, num_unique_fanout, path_type, raw_row
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
     try:
         with gzip.open(csv_path, 'rt', errors='replace') as f:
@@ -112,7 +121,7 @@ def ingest_csv(con, block, run_label, csv_path, mode):
                 int_ext = (row.get('int_ext', '') or '').strip().upper()
                 int_ext_child = (row.get('int_ext_child', '') or '').strip().upper()
 
-                rows.append((
+                batch.append((
                     block,
                     run_label,
                     mode,
@@ -133,23 +142,22 @@ def ingest_csv(con, block, run_label, csv_path, mode):
                     row.get('path_type', '').strip(),
                     '',  # raw_row — skip to save space
                 ))
+
+                if len(batch) >= BATCH_SIZE:
+                    con.executemany(INSERT_SQL, batch)
+                    total_rows += len(batch)
+                    batch = []
+
     except (gzip.BadGzipFile, EOFError) as e:
         print(f"  WARNING: gzip error (partial read): {e}")
 
-    if rows:
-        con.executemany(
-            """INSERT INTO paths (
-                block, run_label, mode, slack, clock_percentage, period,
-                startpoint, endpoint, launch_clock, capture_clock, path_group,
-                int_ext, int_ext_child, driver_partition, receiver_partition,
-                levels_of_logic, num_unique_fanout, path_type, raw_row
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            rows,
-        )
+    if batch:
+        con.executemany(INSERT_SQL, batch)
+        total_rows += len(batch)
 
     elapsed = time.time() - start
-    print(f"  Done ({len(rows):,} failing paths, {elapsed:.1f}s)")
-    return len(rows)
+    print(f"  Done ({total_rows:,} failing paths, {elapsed:.1f}s)")
+    return total_rows
 
 
 def main():
