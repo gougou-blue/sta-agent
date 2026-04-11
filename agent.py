@@ -35,17 +35,10 @@ from config import BLOCKS, DB_PATH
 console = Console()
 
 # GNAI gateway configuration
-GNAI_BASE_URL = "https://gnai.intel.com/api/providers/anthropic/v1"
+GNAI_BASE_URL = "https://gnai.intel.com/api/providers/anthropic"
 GNAI_MODEL = "claude-4-5-sonnet"
 DIRECT_MODEL = "claude-sonnet-4-20250514"
 
-# Common cert bundle locations
-CERT_BUNDLE_PATHS = [
-    os.path.expanduser("~/intel-certs/intel-ca-bundle.crt"),
-    "/etc/ssl/certs/ca-certificates.crt",
-    os.environ.get("REQUESTS_CA_BUNDLE", ""),
-    os.environ.get("SSL_CERT_FILE", ""),
-]
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system.txt")
 
 TOOL_SCHEMA = [
@@ -268,22 +261,6 @@ def main():
         console.print("  bash: export GNAI_API_KEY=your-key-here")
         sys.exit(1)
 
-    # SSL cert bundle for GNAI
-    if use_gnai:
-        cert_bundle = os.environ.get("INTEL_CERT_BUNDLE")
-        if not cert_bundle:
-            for p in CERT_BUNDLE_PATHS:
-                if p and os.path.isfile(p):
-                    cert_bundle = p
-                    break
-        if cert_bundle and os.path.isfile(cert_bundle):
-            os.environ["REQUESTS_CA_BUNDLE"] = cert_bundle
-            os.environ["SSL_CERT_FILE"] = cert_bundle
-            console.print(f"[dim]Using cert bundle: {cert_bundle}[/dim]")
-        else:
-            console.print("[yellow]Warning: No Intel cert bundle found. SSL errors may occur.[/yellow]")
-            console.print("[yellow]Run: python setup_certs.py   (or set INTEL_CERT_BUNDLE)[/yellow]")
-
     # Connect to DuckDB
     if not os.path.exists(args.db):
         console.print(f"[red]Error: Database not found at {args.db}[/red]")
@@ -293,16 +270,9 @@ def main():
     con = duckdb.connect(args.db, read_only=True)
 
     if use_gnai:
-        import httpx
-        http_client = httpx.Client(verify=cert_bundle if cert_bundle else True)
         client = anthropic.Anthropic(
-            api_key="dummy",  # required by SDK but we override with Bearer
             base_url=GNAI_BASE_URL,
-            http_client=http_client,
-            default_headers={
-                "Authorization": f"Bearer {api_key}",
-                "anthropic-version": "2023-06-01",
-            },
+            auth_token=api_key,
         )
         model = GNAI_MODEL
         console.print("[dim]Using Intel GNAI gateway[/dim]")
