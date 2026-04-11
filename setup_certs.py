@@ -40,21 +40,40 @@ def main():
     zip_path = cert_dir / "certs.zip"
 
     print(f"Downloading Intel SHA384 Trust Chain...")
-    try:
-        subprocess.run(
-            ["curl", "-o", str(zip_path), zip_url],
-            check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        # Try wget as fallback
+    # Check if zip was pre-downloaded (e.g. manually placed)
+    pre_downloaded = cert_dir / "certs.zip"
+    if pre_downloaded.exists() and pre_downloaded.stat().st_size > 1000:
+        print(f"  Found pre-downloaded {pre_downloaded}, using it.")
+        zip_path = pre_downloaded
+    else:
+        proxy = os.environ.get("http_proxy", os.environ.get("HTTP_PROXY", ""))
+        curl_args = ["curl", "-L", "-f", "-o", str(zip_path)]
+        if proxy:
+            curl_args += ["-x", proxy]
+        curl_args.append(zip_url)
+
         try:
-            subprocess.run(
-                ["wget", "-O", str(zip_path), zip_url],
-                check=True,
-            )
+            subprocess.run(curl_args, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError):
-            print("Error: Could not download certificates. Install curl or wget.")
-            sys.exit(1)
+            # Try with Intel proxy
+            try:
+                subprocess.run(
+                    ["curl", "-L", "-f", "-x", "http://proxy-dmz.intel.com:912",
+                     "-o", str(zip_path), zip_url],
+                    check=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # Try wget as fallback
+                try:
+                    subprocess.run(
+                        ["wget", "-O", str(zip_path), zip_url],
+                        check=True,
+                    )
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    print("Error: Could not download certificates.")
+                    print(f"  Download manually and place at: {cert_dir}/certs.zip")
+                    print(f"  URL: {zip_url}")
+                    sys.exit(1)
 
     if not zip_path.exists() or zip_path.stat().st_size == 0:
         print("Error: Download failed — empty or missing zip file.")
