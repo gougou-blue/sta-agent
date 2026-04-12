@@ -69,6 +69,20 @@ For each failing path, suggest one of:
 - Always state the total count and severity distribution before diving into details
 - When comparing runs, highlight: new failures, fixed paths, paths that got worse/better
 
+## Ad-hoc Mode (query_csv)
+When the user provides a reports directory or CSV file path, use `query_csv` with `read_csv_auto()` to query it directly. This is for runs not in the pre-ingested database.
+
+Example:
+```sql
+SELECT slack, clock_percentage, startpoint, endpoint, int_ext, path_group, levels_of_logic
+FROM read_csv_auto('/nfs/.../reports/block.scenario.report_summary.max.csv.gz')
+WHERE slack < 0
+ORDER BY slack ASC
+LIMIT 20
+```
+
+For ad-hoc mode, also use `list_reports` with `reports_dir` and `read_report` with `file_path` to access report files directly.
+
 ## SQL Guidelines
 - Always filter by block, run_label, and mode as specified by the user
 - Use `ORDER BY slack ASC` for worst-first ordering

@@ -46,7 +46,7 @@ SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system.
 TOOL_SCHEMA = [
     {
         "name": "query_timing_db",
-        "description": "Execute a SQL query against the timing DuckDB database. Returns results as a list of rows. Use this to answer questions about timing paths, violations, and analysis.",
+        "description": "Execute a SQL query against the timing DuckDB database (pre-ingested data). Returns results as a list of rows. Use this for blocks/runs that are in the database.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -63,8 +63,26 @@ TOOL_SCHEMA = [
         }
     },
     {
+        "name": "query_csv",
+        "description": "Execute a SQL query against a CSV.gz file directly from NFS using DuckDB's read_csv_auto. No ingest needed. Use for ad-hoc analysis of any timing CSV on disk. Example: SELECT slack, clock_percentage, startpoint, endpoint FROM read_csv_auto('/path/to/report_summary.max.csv.gz') WHERE slack < 0 ORDER BY slack LIMIT 20",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "SQL query using read_csv_auto('/path/to/file.csv.gz'). Can join multiple CSV files."
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "Brief explanation of what this query does."
+                }
+            },
+            "required": ["sql", "explanation"]
+        }
+    },
+    {
         "name": "list_available_data",
-        "description": "List all blocks and runs available in the database with row counts.",
+        "description": "List all blocks and runs available in the pre-ingested database with row counts.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -72,49 +90,56 @@ TOOL_SCHEMA = [
     },
     {
         "name": "list_reports",
-        "description": "List available PrimeTime report files (.rpt.gz) for a specific block and run. Returns report names with file sizes. Use this to discover what reports exist before reading them.",
+        "description": "List available PrimeTime report files in a reports directory. Works with both configured blocks and ad-hoc paths. Provide EITHER (block + run_label + mode) for configured blocks, OR (reports_dir) for any NFS directory.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "block": {
                     "type": "string",
-                    "description": "Block name (e.g., d2d1, uio_a_0)"
+                    "description": "Block name (e.g., d2d1) — for configured blocks"
                 },
                 "run_label": {
                     "type": "string",
-                    "description": "Run label (e.g., 26ww14.3_8thApril)"
+                    "description": "Run label — for configured blocks"
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["setup", "hold"],
-                    "description": "setup or hold — determines which scenario's reports to list"
+                    "description": "setup or hold — for configured blocks"
+                },
+                "reports_dir": {
+                    "type": "string",
+                    "description": "Direct path to a reports directory on NFS — for ad-hoc analysis"
                 }
             },
-            "required": ["block", "run_label", "mode"]
         }
     },
     {
         "name": "read_report",
-        "description": "Read a PrimeTime report file (.rpt.gz). Can read first N lines, last N lines, or grep for a pattern. Use for detailed path analysis, timing loops, max transition, QoR, constraints, and other reports. Reports can be very large — always use max_lines or grep to limit output.",
+        "description": "Read a PrimeTime report file (.rpt.gz or .csv.gz). Works with both configured blocks and direct file paths. Provide EITHER (block + run_label + mode + report_name), OR (file_path) for any NFS file. Use max_lines or grep to limit output.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "block": {
                     "type": "string",
-                    "description": "Block name"
+                    "description": "Block name — for configured blocks"
                 },
                 "run_label": {
                     "type": "string",
-                    "description": "Run label"
+                    "description": "Run label — for configured blocks"
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["setup", "hold"],
-                    "description": "setup or hold"
+                    "description": "setup or hold — for configured blocks"
                 },
                 "report_name": {
                     "type": "string",
-                    "description": "Report filename, e.g. 'timing_loops.rpt.gz', 'report_max_transition.rpt.gz', 'report_summary.max.rpt.gz'. Use list_reports to see available files."
+                    "description": "Report filename in the configured reports dir"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Direct absolute path to a report file on NFS — for ad-hoc analysis"
                 },
                 "max_lines": {
                     "type": "integer",
@@ -126,29 +151,43 @@ TOOL_SCHEMA = [
                 },
                 "grep": {
                     "type": "string",
-                    "description": "Return only lines matching this pattern (case-insensitive regex). Useful to search for specific paths, clocks, or sections."
+                    "description": "Return only lines matching this pattern (case-insensitive regex)."
                 },
                 "context_lines": {
                     "type": "integer",
                     "description": "Number of lines of context around grep matches (default 2)."
                 }
             },
-            "required": ["block", "run_label", "mode", "report_name"]
         }
     },
 ]
 
 
-def load_system_prompt():
+def load_system_prompt(reports_dir=None):
     """Load the system prompt and append available data context."""
     with open(SYSTEM_PROMPT_PATH, "r") as f:
         prompt = f.read()
 
-    # Append available blocks/runs
+    # Append available blocks/runs from config
     context = "\n\n## Available Data\n"
     for block, data in BLOCKS.items():
         runs = ", ".join(r["label"] for r in data["runs"])
         context += f"- **{block}** (owner: {data['owner']}): {runs}\n"
+
+    # Append ad-hoc reports directory if provided
+    if reports_dir:
+        context += f"\n## Ad-hoc Reports Directory\n"
+        context += f"The user has pointed to: `{reports_dir}`\n"
+        context += f"Use `list_reports` with reports_dir to discover available files.\n"
+        context += f"Use `query_csv` with read_csv_auto() to query CSV files directly.\n"
+        context += f"Use `read_report` with file_path to read report files directly.\n"
+        # List CSV files for convenience
+        if os.path.isdir(reports_dir):
+            csvs = [f for f in os.listdir(reports_dir) if f.endswith('.csv.gz') or f.endswith('.csv')]
+            if csvs:
+                context += f"\nCSV files available for query_csv:\n"
+                for c in sorted(csvs):
+                    context += f"- `{os.path.join(reports_dir, c)}`\n"
 
     return prompt + context
 
@@ -218,18 +257,21 @@ def get_reports_dir(block, run_label, mode):
     return None
 
 
-def list_report_files(block, run_label, mode):
+def list_report_files(block=None, run_label=None, mode=None, reports_dir=None):
     """List .rpt.gz files in the reports directory."""
-    reports_dir = get_reports_dir(block, run_label, mode)
-    if not reports_dir:
+    if reports_dir:
+        rdir = reports_dir
+    else:
+        rdir = get_reports_dir(block, run_label, mode)
+    if not rdir:
         return {"error": f"No config found for {block}/{run_label}/{mode}"}
-    if not os.path.isdir(reports_dir):
-        return {"error": f"Directory not found: {reports_dir}"}
+    if not os.path.isdir(rdir):
+        return {"error": f"Directory not found: {rdir}"}
 
     files = []
-    for f in sorted(os.listdir(reports_dir)):
-        if f.endswith('.rpt.gz') or f.endswith('.rpt'):
-            fpath = os.path.join(reports_dir, f)
+    for f in sorted(os.listdir(rdir)):
+        if f.endswith('.rpt.gz') or f.endswith('.rpt') or f.endswith('.csv.gz') or f.endswith('.csv'):
+            fpath = os.path.join(rdir, f)
             size = os.path.getsize(fpath)
             # Show human-readable size
             if size > 1024 * 1024:
@@ -240,23 +282,29 @@ def list_report_files(block, run_label, mode):
                 size_str = f"{size}B"
             files.append({"name": f, "size": size_str})
 
-    return {"directory": reports_dir, "files": files, "count": len(files)}
+    return {"directory": rdir, "files": files, "count": len(files)}
 
 
-def read_report_file(block, run_label, mode, report_name, max_lines=200,
-                     tail=False, grep=None, context_lines=2):
+def read_report_file(block=None, run_label=None, mode=None, report_name=None,
+                     max_lines=200, tail=False, grep=None, context_lines=2,
+                     file_path=None):
     """Read a .rpt.gz file with head/tail/grep support."""
-    reports_dir = get_reports_dir(block, run_label, mode)
-    if not reports_dir:
-        return {"error": f"No config found for {block}/{run_label}/{mode}"}
+    if file_path:
+        # Direct file path mode — validate it's under /nfs/
+        if not file_path.startswith('/nfs/'):
+            return {"error": "file_path must be an absolute NFS path starting with /nfs/"}
+        fpath = file_path
+    else:
+        reports_dir = get_reports_dir(block, run_label, mode)
+        if not reports_dir:
+            return {"error": f"No config found for {block}/{run_label}/{mode}"}
+        # Security: prevent path traversal
+        if '..' in report_name or '/' in report_name:
+            return {"error": "Invalid report name"}
+        fpath = os.path.join(reports_dir, report_name)
 
-    # Security: prevent path traversal
-    if '..' in report_name or '/' in report_name:
-        return {"error": "Invalid report name"}
-
-    fpath = os.path.join(reports_dir, report_name)
     if not os.path.isfile(fpath):
-        return {"error": f"File not found: {report_name}"}
+        return {"error": f"File not found: {fpath}"}
 
     max_lines = min(max_lines or 200, 500)  # Cap at 500 lines
 
@@ -331,35 +379,50 @@ def handle_tool_call(con, tool_name, tool_input):
         display_result(result)
         return json.dumps(result, default=str)
 
+    elif tool_name == "query_csv":
+        sql = tool_input["sql"]
+        explanation = tool_input.get("explanation", "")
+        console.print(f"\n[dim]CSV Query: {explanation}[/dim]")
+        console.print(f"[dim]{sql}[/dim]\n")
+        # Security: only allow read_csv_auto on /nfs/ paths
+        if 'read_csv_auto' not in sql.lower():
+            return json.dumps({"error": "query_csv must use read_csv_auto()"})
+        result = execute_query(con, sql)
+        display_result(result)
+        return json.dumps(result, default=str)
+
     elif tool_name == "list_available_data":
         result = list_data(con)
         display_result(result)
         return json.dumps(result, default=str)
 
     elif tool_name == "list_reports":
-        block = tool_input["block"]
-        run_label = tool_input["run_label"]
-        mode = tool_input["mode"]
-        console.print(f"\n[dim]Listing reports for {block}/{run_label} ({mode})[/dim]\n")
-        result = list_report_files(block, run_label, mode)
+        block = tool_input.get("block")
+        run_label = tool_input.get("run_label")
+        mode = tool_input.get("mode")
+        reports_dir = tool_input.get("reports_dir")
+        label = reports_dir or f"{block}/{run_label} ({mode})"
+        console.print(f"\n[dim]Listing reports: {label}[/dim]\n")
+        result = list_report_files(block, run_label, mode, reports_dir)
         if "error" not in result:
             for f in result["files"]:
                 console.print(f"  [dim]{f['size']:>8s}  {f['name']}[/dim]")
-            console.print(f"  [dim]({result['count']} report files)[/dim]")
+            console.print(f"  [dim]({result['count']} files)[/dim]")
         else:
             console.print(f"[red]{result['error']}[/red]")
         return json.dumps(result, default=str)
 
     elif tool_name == "read_report":
-        block = tool_input["block"]
-        run_label = tool_input["run_label"]
-        mode = tool_input["mode"]
-        report_name = tool_input["report_name"]
+        block = tool_input.get("block")
+        run_label = tool_input.get("run_label")
+        mode = tool_input.get("mode")
+        report_name = tool_input.get("report_name")
+        file_path = tool_input.get("file_path")
         max_lines = tool_input.get("max_lines", 200)
         tail = tool_input.get("tail", False)
         grep_pat = tool_input.get("grep")
         context_lines = tool_input.get("context_lines", 2)
-        label = f"{block}/{run_label}/{report_name}"
+        label = file_path or f"{block}/{run_label}/{report_name}"
         if grep_pat:
             console.print(f"\n[dim]Reading {label} (grep: {grep_pat})[/dim]\n")
         elif tail:
@@ -367,7 +430,8 @@ def handle_tool_call(con, tool_name, tool_input):
         else:
             console.print(f"\n[dim]Reading {label} (head {max_lines})[/dim]\n")
         result = read_report_file(block, run_label, mode, report_name,
-                                  max_lines, tail, grep_pat, context_lines)
+                                  max_lines, tail, grep_pat, context_lines,
+                                  file_path=file_path)
         if "error" in result:
             console.print(f"[red]{result['error']}[/red]")
         else:
@@ -377,7 +441,7 @@ def handle_tool_call(con, tool_name, tool_input):
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
-def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL):
+def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL, reports_dir=None):
     """Run the agent loop: question → tool calls → analysis."""
 
     # Build the user message with optional context
@@ -388,8 +452,10 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
         user_msg += f", run={run}"
     if mode:
         user_msg += f", mode={mode}"
+    if reports_dir:
+        user_msg += f"\n\nReports directory: {reports_dir}"
 
-    system_prompt = load_system_prompt()
+    system_prompt = load_system_prompt(reports_dir=reports_dir)
     messages = [{"role": "user", "content": user_msg}]
 
     console.print(f"\n[bold]Question:[/bold] {question}\n")
@@ -439,7 +505,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
     console.print()
 
 
-def interactive_mode(con, client, model=DIRECT_MODEL):
+def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
     """Interactive REPL mode."""
     console.print("[bold]Timing Analysis Agent[/bold] — Interactive Mode")
     console.print("Type your question, or 'quit' to exit.\n")
@@ -453,16 +519,24 @@ def interactive_mode(con, client, model=DIRECT_MODEL):
         if not question or question.lower() in ("quit", "exit", "q"):
             break
 
-        run_agent(con, client, question, model=model)
+        run_agent(con, client, question, model=model, reports_dir=reports_dir)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Timing Analysis Agent")
+    parser = argparse.ArgumentParser(
+        description="Timing Analysis Agent",
+        epilog="Examples:\n"
+               "  python agent.py 'top 10 worst setup paths in d2d1'\n"
+               "  python agent.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
+               "  python agent.py -i\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("question", nargs="?", help="Question to ask (or use --interactive)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Interactive mode")
     parser.add_argument("--block", "-b", help="Focus on a specific block")
     parser.add_argument("--run", "-r", help="Focus on a specific run")
     parser.add_argument("--mode", "-m", choices=["setup", "hold"], help="Focus on setup or hold")
+    parser.add_argument("--reports-dir", help="Path to a sta_pt reports directory (ad-hoc mode, no ingest needed)")
     parser.add_argument("--db", default=DB_PATH, help=f"DuckDB path (default: {DB_PATH})")
     args = parser.parse_args()
 
@@ -481,13 +555,15 @@ def main():
         console.print("  bash: export GNAI_API_KEY=your-key-here")
         sys.exit(1)
 
-    # Connect to DuckDB
-    if not os.path.exists(args.db):
-        console.print(f"[red]Error: Database not found at {args.db}[/red]")
-        console.print("Run `python ingest.py` first to build the database.")
-        sys.exit(1)
-
-    con = duckdb.connect(args.db, read_only=True)
+    # Connect to DuckDB — in-memory if no pre-built DB exists (ad-hoc mode)
+    if os.path.exists(args.db):
+        con = duckdb.connect(args.db, read_only=True)
+        console.print(f"[dim]Database: {args.db}[/dim]")
+    else:
+        con = duckdb.connect(":memory:")
+        if not args.reports_dir:
+            console.print("[yellow]No pre-built database found. Use --reports-dir for ad-hoc analysis,[/yellow]")
+            console.print("[yellow]or run `python ingest.py` to build the database.[/yellow]")
 
     if use_gnai:
         client = anthropic.Anthropic(
@@ -503,9 +579,10 @@ def main():
 
     try:
         if args.interactive:
-            interactive_mode(con, client, model)
+            interactive_mode(con, client, model, reports_dir=args.reports_dir)
         elif args.question:
-            run_agent(con, client, args.question, args.block, args.run, args.mode, model=model)
+            run_agent(con, client, args.question, args.block, args.run, args.mode,
+                      model=model, reports_dir=args.reports_dir)
         else:
             parser.print_help()
     finally:
