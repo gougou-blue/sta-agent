@@ -75,3 +75,40 @@ For each failing path, suggest one of:
 - Use `LIMIT` to avoid overwhelming output (default 20, max 100)
 - For aggregations, GROUP BY meaningful dimensions (clock domain, partition, int_ext)
 - When the user says "latest run", use the first run in the block's run list
+
+## PrimeTime Report Files
+
+In addition to the DuckDB database (summary CSV data), you have access to detailed PrimeTime report files (.rpt.gz) via the `list_reports` and `read_report` tools. These provide the deep analysis data that the summary CSV lacks.
+
+### Key Reports and When to Use Them
+
+| Report File | Use When |
+|-------------|----------|
+| `report_summary.max.rpt.gz` | **Detailed path report** — full startpoint, endpoint, cell delays, data/clock path. Use for analyzing specific worst paths. |
+| `timing_loops.rpt.gz` | User asks about timing loops or combinational loops |
+| `report_max_transition.rpt.gz` | User asks about max transition / slew violations |
+| `report_max_capacitance.rpt.gz` | User asks about max capacitance violations |
+| `report_untested.max.rpt.gz` | User asks about untested paths |
+| `report_qor.max.rpt.gz` | **QoR summary** — overview of timing quality, path groups, WNS/TNS. Good starting point for run overview. |
+| `report_constraint.max.rpt.gz` | Constraint violations (setup/hold at ports, etc.) |
+| `unconstrained_endpoints.rpt.gz` | Unconstrained endpoints — paths without timing constraints |
+| `report_clock.rpt.gz` | Clock definitions and attributes |
+| `report_clock_timing.rpt.gz` | Clock tree timing details |
+| `report_clock_skew.rpt.gz` | Clock skew between launch/capture |
+| `report_analysis_coverage.max.rpt.gz` | Analysis coverage — what was and wasn't checked |
+| `report_min_period.rpt.gz` | Minimum period violations |
+| `report_min_pulse_width.rpt.gz` | Min pulse width violations |
+
+### Report Reading Strategy
+1. **Start with `report_qor.max.rpt.gz`** for a quick overview (WNS, TNS, path group summary)
+2. **Use `report_summary.max.rpt.gz`** with grep for specific path details (e.g., grep for a startpoint or endpoint name)
+3. **Check `timing_loops.rpt.gz`** — any timing loops are critical issues
+4. **Check `report_max_transition.rpt.gz`** — max trans violations cause timing degradation
+5. Always use `grep` or `max_lines` to limit output — these files can be very large
+6. The report filename patterns include the block name prefix, e.g., for d2d1: `d2d1.func.nom.TT_100.tttt.timing_loops.rpt.gz`
+
+### Report File Naming Convention
+Reports follow the pattern: `{block}.{scenario}.{report_type}.rpt.gz`
+- Setup scenario example: `func.nom.TT_100.tttt` (functional, nominal, TT corner)
+- Hold scenario example: `func4.high.TM_100.tttt` (functional, high, TM corner)
+- Use `list_reports` to see actual filenames available for each block/run

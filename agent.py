@@ -19,8 +19,10 @@ Environment:
 """
 
 import argparse
+import gzip
 import json
 import os
+import re
 import sys
 import textwrap
 
@@ -66,6 +68,72 @@ TOOL_SCHEMA = [
         "input_schema": {
             "type": "object",
             "properties": {},
+        }
+    },
+    {
+        "name": "list_reports",
+        "description": "List available PrimeTime report files (.rpt.gz) for a specific block and run. Returns report names with file sizes. Use this to discover what reports exist before reading them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "block": {
+                    "type": "string",
+                    "description": "Block name (e.g., d2d1, uio_a_0)"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label (e.g., 26ww14.3_8thApril)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold — determines which scenario's reports to list"
+                }
+            },
+            "required": ["block", "run_label", "mode"]
+        }
+    },
+    {
+        "name": "read_report",
+        "description": "Read a PrimeTime report file (.rpt.gz). Can read first N lines, last N lines, or grep for a pattern. Use for detailed path analysis, timing loops, max transition, QoR, constraints, and other reports. Reports can be very large — always use max_lines or grep to limit output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "block": {
+                    "type": "string",
+                    "description": "Block name"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold"
+                },
+                "report_name": {
+                    "type": "string",
+                    "description": "Report filename, e.g. 'timing_loops.rpt.gz', 'report_max_transition.rpt.gz', 'report_summary.max.rpt.gz'. Use list_reports to see available files."
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum lines to return (default 200). Use to read the beginning of a report."
+                },
+                "tail": {
+                    "type": "boolean",
+                    "description": "If true, read last max_lines instead of first."
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "Return only lines matching this pattern (case-insensitive regex). Useful to search for specific paths, clocks, or sections."
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of lines of context around grep matches (default 2)."
+                }
+            },
+            "required": ["block", "run_label", "mode", "report_name"]
         }
     },
 ]
@@ -137,6 +205,121 @@ def display_result(result):
     console.print(table)
 
 
+def get_reports_dir(block, run_label, mode):
+    """Derive the reports directory from config CSV paths."""
+    if block not in BLOCKS:
+        return None
+    for run in BLOCKS[block]["runs"]:
+        if run["label"] == run_label:
+            csv_key = "setup_csv" if mode == "setup" else "hold_csv"
+            csv_path = run.get(csv_key, "")
+            if csv_path:
+                return os.path.dirname(csv_path)
+    return None
+
+
+def list_report_files(block, run_label, mode):
+    """List .rpt.gz files in the reports directory."""
+    reports_dir = get_reports_dir(block, run_label, mode)
+    if not reports_dir:
+        return {"error": f"No config found for {block}/{run_label}/{mode}"}
+    if not os.path.isdir(reports_dir):
+        return {"error": f"Directory not found: {reports_dir}"}
+
+    files = []
+    for f in sorted(os.listdir(reports_dir)):
+        if f.endswith('.rpt.gz') or f.endswith('.rpt'):
+            fpath = os.path.join(reports_dir, f)
+            size = os.path.getsize(fpath)
+            # Show human-readable size
+            if size > 1024 * 1024:
+                size_str = f"{size / (1024*1024):.1f}MB"
+            elif size > 1024:
+                size_str = f"{size / 1024:.1f}KB"
+            else:
+                size_str = f"{size}B"
+            files.append({"name": f, "size": size_str})
+
+    return {"directory": reports_dir, "files": files, "count": len(files)}
+
+
+def read_report_file(block, run_label, mode, report_name, max_lines=200,
+                     tail=False, grep=None, context_lines=2):
+    """Read a .rpt.gz file with head/tail/grep support."""
+    reports_dir = get_reports_dir(block, run_label, mode)
+    if not reports_dir:
+        return {"error": f"No config found for {block}/{run_label}/{mode}"}
+
+    # Security: prevent path traversal
+    if '..' in report_name or '/' in report_name:
+        return {"error": "Invalid report name"}
+
+    fpath = os.path.join(reports_dir, report_name)
+    if not os.path.isfile(fpath):
+        return {"error": f"File not found: {report_name}"}
+
+    max_lines = min(max_lines or 200, 500)  # Cap at 500 lines
+
+    try:
+        open_fn = gzip.open if fpath.endswith('.gz') else open
+        with open_fn(fpath, 'rt', errors='replace') as f:
+            all_lines = f.readlines()
+    except Exception as e:
+        return {"error": f"Failed to read: {e}"}
+
+    total_lines = len(all_lines)
+
+    if grep:
+        # Grep mode: find matching lines with context
+        try:
+            pattern = re.compile(grep, re.IGNORECASE)
+        except re.error as e:
+            return {"error": f"Invalid regex: {e}"}
+
+        matches = []
+        match_indices = set()
+        for i, line in enumerate(all_lines):
+            if pattern.search(line):
+                match_indices.add(i)
+
+        # Add context lines
+        expanded = set()
+        for idx in match_indices:
+            for c in range(max(0, idx - context_lines), min(total_lines, idx + context_lines + 1)):
+                expanded.add(c)
+
+        result_lines = []
+        prev_idx = -2
+        for idx in sorted(expanded):
+            if idx > prev_idx + 1:
+                result_lines.append("---")
+            result_lines.append(f"{idx+1}: {all_lines[idx].rstrip()}")
+            prev_idx = idx
+            if len(result_lines) >= max_lines:
+                break
+
+        return {
+            "total_lines": total_lines,
+            "matches": len(match_indices),
+            "content": "\n".join(result_lines),
+        }
+    elif tail:
+        lines = all_lines[-max_lines:]
+        start = total_lines - len(lines) + 1
+        content = "\n".join(f"{start+i}: {l.rstrip()}" for i, l in enumerate(lines))
+        return {"total_lines": total_lines, "showing": f"last {len(lines)}", "content": content}
+    else:
+        lines = all_lines[:max_lines]
+        content = "\n".join(f"{i+1}: {l.rstrip()}" for i, l in enumerate(lines))
+        truncated = total_lines > max_lines
+        return {
+            "total_lines": total_lines,
+            "showing": f"first {len(lines)}",
+            "truncated": truncated,
+            "content": content,
+        }
+
+
 def handle_tool_call(con, tool_name, tool_input):
     """Execute a tool call and return the result."""
     if tool_name == "query_timing_db":
@@ -146,12 +329,49 @@ def handle_tool_call(con, tool_name, tool_input):
         console.print(f"[dim]{sql}[/dim]\n")
         result = execute_query(con, sql)
         display_result(result)
-        # Return as string for the LLM
         return json.dumps(result, default=str)
 
     elif tool_name == "list_available_data":
         result = list_data(con)
         display_result(result)
+        return json.dumps(result, default=str)
+
+    elif tool_name == "list_reports":
+        block = tool_input["block"]
+        run_label = tool_input["run_label"]
+        mode = tool_input["mode"]
+        console.print(f"\n[dim]Listing reports for {block}/{run_label} ({mode})[/dim]\n")
+        result = list_report_files(block, run_label, mode)
+        if "error" not in result:
+            for f in result["files"]:
+                console.print(f"  [dim]{f['size']:>8s}  {f['name']}[/dim]")
+            console.print(f"  [dim]({result['count']} report files)[/dim]")
+        else:
+            console.print(f"[red]{result['error']}[/red]")
+        return json.dumps(result, default=str)
+
+    elif tool_name == "read_report":
+        block = tool_input["block"]
+        run_label = tool_input["run_label"]
+        mode = tool_input["mode"]
+        report_name = tool_input["report_name"]
+        max_lines = tool_input.get("max_lines", 200)
+        tail = tool_input.get("tail", False)
+        grep_pat = tool_input.get("grep")
+        context_lines = tool_input.get("context_lines", 2)
+        label = f"{block}/{run_label}/{report_name}"
+        if grep_pat:
+            console.print(f"\n[dim]Reading {label} (grep: {grep_pat})[/dim]\n")
+        elif tail:
+            console.print(f"\n[dim]Reading {label} (tail {max_lines})[/dim]\n")
+        else:
+            console.print(f"\n[dim]Reading {label} (head {max_lines})[/dim]\n")
+        result = read_report_file(block, run_label, mode, report_name,
+                                  max_lines, tail, grep_pat, context_lines)
+        if "error" in result:
+            console.print(f"[red]{result['error']}[/red]")
+        else:
+            console.print(f"[dim]({result['total_lines']} total lines)[/dim]")
         return json.dumps(result, default=str)
 
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
