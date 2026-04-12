@@ -155,6 +155,9 @@ def ingest_csv(con, block, run_label, csv_path, mode):
         con.executemany(INSERT_SQL, batch)
         total_rows += len(batch)
 
+    # Flush to disk to free memory
+    con.execute("CHECKPOINT")
+
     elapsed = time.time() - start
     print(f"  Done ({total_rows:,} failing paths, {elapsed:.1f}s)")
     return total_rows
@@ -173,6 +176,7 @@ def main():
         os.makedirs(db_dir, exist_ok=True)
 
     con = duckdb.connect(args.db)
+    con.execute("SET memory_limit='2GB'")
 
     if args.fresh:
         print("Dropping existing paths table...")
