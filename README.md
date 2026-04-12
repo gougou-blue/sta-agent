@@ -6,8 +6,8 @@ AI-powered CLI for Static Timing Analysis. Ask questions about your PrimeTime re
 
 ```bash
 # 1. Clone
-git clone https://github.com/gougou-blue/timing-agent.git
-cd timing-agent
+git clone https://github.com/gougou-blue/sta-agent.git
+cd sta-agent
 
 # 2. Install dependencies (Python 3.11+)
 python3 -m pip install --user -r requirements.txt
