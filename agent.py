@@ -441,22 +441,32 @@ def handle_tool_call(con, tool_name, tool_input):
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
 
-def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL, reports_dir=None):
-    """Run the agent loop: question → tool calls → analysis."""
+def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL,
+              reports_dir=None, messages=None):
+    """Run the agent loop: question → tool calls → analysis.
+    
+    If messages is provided, appends to existing conversation (for follow-ups).
+    Returns the updated messages list for conversation continuity.
+    """
 
     # Build the user message with optional context
     user_msg = question
-    if block:
-        user_msg += f"\n\nContext: block={block}"
-    if run:
-        user_msg += f", run={run}"
-    if mode:
-        user_msg += f", mode={mode}"
-    if reports_dir:
-        user_msg += f"\n\nReports directory: {reports_dir}"
+    if not messages:
+        # First question — add context
+        if block:
+            user_msg += f"\n\nContext: block={block}"
+        if run:
+            user_msg += f", run={run}"
+        if mode:
+            user_msg += f", mode={mode}"
+        if reports_dir:
+            user_msg += f"\n\nReports directory: {reports_dir}"
 
     system_prompt = load_system_prompt(reports_dir=reports_dir)
-    messages = [{"role": "user", "content": user_msg}]
+
+    if messages is None:
+        messages = []
+    messages.append({"role": "user", "content": user_msg})
 
     console.print(f"\n[bold]Question:[/bold] {question}\n")
 
@@ -493,6 +503,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
 
         # If stop_reason is end_turn, we're done
         if response.stop_reason == "end_turn":
+            messages.append({"role": "assistant", "content": response.content})
             break
 
         # If there were tool calls, add the assistant response and tool results
@@ -500,15 +511,20 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
             messages.append({"role": "assistant", "content": response.content})
             messages.append({"role": "user", "content": tool_results})
         else:
+            messages.append({"role": "assistant", "content": response.content})
             break
 
     console.print()
+    return messages
 
 
 def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
-    """Interactive REPL mode."""
+    """Interactive REPL mode with conversation history."""
     console.print("[bold]Timing Analysis Agent[/bold] — Interactive Mode")
-    console.print("Type your question, or 'quit' to exit.\n")
+    console.print("Type your question, or 'quit' to exit.")
+    console.print("[dim]Follow-up questions remember previous context. Type 'reset' to clear history.[/dim]\n")
+
+    messages = None  # Will be initialized on first question
 
     while True:
         try:
@@ -519,7 +535,13 @@ def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
         if not question or question.lower() in ("quit", "exit", "q"):
             break
 
-        run_agent(con, client, question, model=model, reports_dir=reports_dir)
+        if question.lower() == "reset":
+            messages = None
+            console.print("[dim]Conversation history cleared.[/dim]\n")
+            continue
+
+        messages = run_agent(con, client, question, model=model,
+                             reports_dir=reports_dir, messages=messages)
 
 
 def main():
