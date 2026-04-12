@@ -1,61 +1,83 @@
-# Timing Analysis Agent
+# STA Agent
 
-AI-powered CLI tool for analyzing STA (Static Timing Analysis) timing violations from PrimeTime sta_pt reports.
+AI-powered CLI for Static Timing Analysis. Ask questions about your PrimeTime reports in plain English — get analysis, root causes, and fix recommendations.
 
-## Quick Start
+## Setup (5 minutes)
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+# 1. Clone
+git clone https://github.com/gougou-blue/timing-agent.git
+cd timing-agent
 
-# 2. Set API key
-export ANTHROPIC_API_KEY=your-key-here
+# 2. Install dependencies (Python 3.11+)
+python3 -m pip install --user -r requirements.txt
 
-# 3. Ingest CSV data into DuckDB
-python ingest.py
-
-# 4. Ask questions
-python agent.py "top 10 worst setup paths in d2d1 latest run"
-python agent.py -i   # interactive mode
+# 3. Get your GNAI token
+#    - Request AGS entitlement: https://goto.intel.com/ags-gnai-public
+#    - Generate token: https://gnai.intel.com/auth/oauth2/sso
+#    (csh)
+setenv GNAI_API_KEY "your-token-here"
+#    (bash)
+export GNAI_API_KEY="your-token-here"
 ```
 
-## Commands
+## Usage
 
-### Ingest
+### Analyze any timing run (no setup, no ingest)
+
+Point `--reports-dir` at your sta_pt reports directory:
+
 ```bash
-python ingest.py                  # Ingest all blocks/runs
-python ingest.py --block d2d1     # Ingest one block
-python ingest.py --fresh          # Drop and rebuild
+python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "analyze worst setup paths and suggest fixes"
+python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "check for timing loops"
+python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "any max transition violations?"
 ```
 
-### Query
+### Interactive mode (follow-up questions)
+
 ```bash
-# One-shot questions
-python agent.py "worst 20 setup paths in d2d4 26ww15.2"
-python agent.py "compare d2d4 ww15.2 vs ww14.5 setup — what regressed?"
-python agent.py "which clock domains have the most hold violations in memstack?"
-python agent.py "top 10 worst paths in d2d1 and propose fixes"
-
-# With filters
-python agent.py --block d2d1 --mode setup "worst external paths and suggest actions"
-
-# Interactive mode
-python agent.py --interactive
+python3 agent.py -i --reports-dir /path/to/reports/
+> worst 10 setup paths?
+[... analysis ...]
+> does the PHY from our previous project have the same issue?
+[... follow-up with context ...]
+> what about hold violations?
+> reset    # clear history and start fresh
+> quit
 ```
+
+### Pre-ingested data (NWPNIO blocks)
+
+For blocks already in the database:
+
+```bash
+python3 agent.py "worst 20 setup paths in d2d4 26ww15.2"
+python3 agent.py "compare d2d4 ww15.2 vs ww14.5 setup — what regressed?"
+python3 agent.py "which clock domains have the most hold violations?"
+python3 agent.py -i   # interactive with pre-ingested data
+```
+
+## What it can do
+
+- **Path analysis**: Worst paths, root cause identification, fix recommendations
+- **Run comparison**: What regressed, what improved between runs
+- **Report reading**: Timing loops, max transition, QoR, constraints, untested paths
+- **Trend analysis**: Violations across work weeks (with pre-ingested data)
+- **Ad-hoc queries**: SQL against any CSV.gz on NFS via DuckDB
 
 ## Architecture
 
 ```
-config.py           — Block/run/CSV path configuration
-ingest.py           — Parse sta_pt CSV.gz → DuckDB
-agent.py            — CLI: question → Claude → SQL → analysis
-prompts/system.txt  — Domain knowledge and analysis guidelines
+agent.py            — CLI: question → Claude → SQL/reports → analysis
+config.py           — Block/run configuration (for pre-ingested data)
+ingest.py           — Parse sta_pt CSV.gz → DuckDB (optional)
+prompts/system.txt  — STA domain knowledge and analysis guidelines
 ```
 
-## Data Flow
+## Token refresh
 
-1. **ingest.py** reads sta_pt `report_summary.{max|min}.csv.gz` files
-2. Extracts all failing paths (negative slack) with full metadata
-3. Stores in DuckDB (`paths` table) with indexes on slack, block, int_ext
-4. **agent.py** sends user question + schema + domain context to Claude
-5. Claude generates SQL, agent executes on DuckDB, Claude analyzes results
+GNAI tokens expire periodically. Visit https://gnai.intel.com/auth/oauth2/sso to get a fresh one.
+
+## Feedback
+
+Report issues or suggestions to jymarc@intel.com

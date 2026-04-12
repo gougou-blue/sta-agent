@@ -1,5 +1,5 @@
 """
-Block and run configuration for the timing agent.
+Block and run configuration for STA Agent.
 Mirrors the dashboard's backend/config.js — same CSV paths.
 """
 
@@ -77,4 +77,4 @@ BLOCKS = {
 }
 
 # DuckDB database path (on the Linux server)
-DB_PATH = "/nfs/site/disks/nwp_fct_0001/jymarc/timing-agent/timing.duckdb"
+DB_PATH = "/nfs/site/disks/nwp_fct_0001/jymarc/sta-agent/timing.duckdb"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ingest sta_pt CSV.gz files into a DuckDB database for the timing analysis agent.
+Ingest sta_pt CSV.gz files into a DuckDB database for STA Agent.
 
 Usage:
     python ingest.py                  # Ingest all blocks/runs from config

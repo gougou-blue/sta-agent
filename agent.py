@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Timing Analysis Agent — CLI interface.
+STA Agent — AI-powered STA analysis CLI.
 
 Uses Claude (via Intel GNAI gateway) to translate natural language questions
 into SQL queries against a DuckDB database of STA timing paths, then
@@ -520,7 +520,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
 
 def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
     """Interactive REPL mode with conversation history."""
-    console.print("[bold]Timing Analysis Agent[/bold] — Interactive Mode")
+    console.print("[bold]STA Agent[/bold] — Interactive Mode")
     console.print("Type your question, or 'quit' to exit.")
     console.print("[dim]Follow-up questions remember previous context. Type 'reset' to clear history.[/dim]\n")
 
@@ -546,7 +546,7 @@ def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Timing Analysis Agent",
+        description="STA Agent — AI-powered timing analysis",
         epilog="Examples:\n"
                "  python agent.py 'top 10 worst setup paths in d2d1'\n"
                "  python agent.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
