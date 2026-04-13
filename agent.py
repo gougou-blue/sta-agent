@@ -243,6 +243,56 @@ TOOL_SCHEMA = [
             "required": ["block", "run_label", "mode", "output_path", "buckets"]
         }
     },
+    {
+        "name": "validate_buckets",
+        "description": "Test bucket filter coverage against actual failing paths. For each bucket, runs its regex filters as SQL against the data and counts how many paths match. Returns per-bucket match counts, total unmatched (catch-all) count and percentage, and a sample of 50 unmatched paths for pattern analysis. Use this AFTER creating buckets to verify coverage, then create additional buckets from the unmatched sample. Repeat until unmatched < 5%.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "block": {
+                    "type": "string",
+                    "description": "Block name"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold"
+                },
+                "csv_path": {
+                    "type": "string",
+                    "description": "Path to CSV.gz for ad-hoc mode"
+                },
+                "buckets": {
+                    "type": "array",
+                    "description": "List of bucket definitions (same format as export_bucket_file)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Filter expressions: StartPin:<regex>, EndPin:<regex>, LaunchClk:<regex>, etc."
+                            },
+                            "classification": {
+                                "type": "string",
+                                "description": "Owner classification"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Bucket description"
+                            }
+                        },
+                        "required": ["filters", "classification"]
+                    }
+                }
+            },
+            "required": ["mode", "buckets"]
+        }
+    },
 ]
 
 
@@ -605,6 +655,145 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     }
 
 
+# Column name mapping: timinglite filter name → DuckDB column name
+FILTER_COL_MAP = {
+    "LaunchClk": "launch_clock",
+    "CaptureClk": "capture_clock",
+    "StartPin": "startpoint",
+    "EndPin": "endpoint",
+    "PercentPeriod": "clock_percentage",
+    "PathType": "path_type",
+    "PathGroup": "path_group",
+}
+
+
+def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
+    """Test bucket filter coverage against actual failing paths.
+
+    For each bucket, builds a SQL WHERE clause from its regex filters and counts
+    how many failing paths it matches. Returns per-bucket match counts and the
+    total unmatched (catch-all) count with sample unmatched paths.
+    """
+    try:
+        if csv_path:
+            source = f"read_csv_auto('{csv_path}')"
+            base_where = "slack < 0"
+            params = []
+        else:
+            source = "paths"
+            base_where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
+            params = [block, run_label, mode]
+
+        path_type = "max" if mode == "setup" else "min"
+
+        # Get total failing
+        total_row = con.execute(
+            f"SELECT COUNT(*) FROM {source} WHERE {base_where}", params
+        ).fetchone()
+        total_failing = total_row[0]
+
+        bucket_results = []
+        all_matched_conditions = []
+
+        for i, bucket in enumerate(buckets):
+            raw_filters = bucket.get("filters", [])
+            # Remove PathType from filters (we add it)
+            raw_filters = [f for f in raw_filters if not f.startswith("PathType:")]
+            filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
+
+            conditions = []
+            for filt in filters:
+                if ':' not in filt:
+                    continue
+                col_name, regex_val = filt.split(':', 1)
+                db_col = FILTER_COL_MAP.get(col_name, col_name)
+                if db_col == "path_type":
+                    conditions.append(f"path_type = '{path_type}'")
+                elif db_col == "clock_percentage":
+                    # PercentPeriod filters are numeric comparisons, not regex
+                    # Skip for now — they don't significantly affect coverage
+                    continue
+                else:
+                    # Use regexp_matches for regex filters
+                    safe_regex = regex_val.replace("'", "''")
+                    conditions.append(f"regexp_matches({db_col}, '{safe_regex}')")
+
+            if not conditions:
+                bucket_results.append({
+                    "bucket_index": i,
+                    "classification": bucket.get("classification", ""),
+                    "description": bucket.get("description", "")[:80],
+                    "matched_paths": 0,
+                    "error": "no valid filters",
+                })
+                continue
+
+            bucket_where = " AND ".join(conditions)
+            full_where = f"{base_where} AND {bucket_where}"
+
+            try:
+                count_row = con.execute(
+                    f"SELECT COUNT(*) FROM {source} WHERE {full_where}", params
+                ).fetchone()
+                matched = count_row[0]
+            except Exception as e:
+                bucket_results.append({
+                    "bucket_index": i,
+                    "classification": bucket.get("classification", ""),
+                    "description": bucket.get("description", "")[:80],
+                    "matched_paths": 0,
+                    "error": f"regex error: {str(e)[:100]}",
+                })
+                continue
+
+            bucket_results.append({
+                "bucket_index": i,
+                "classification": bucket.get("classification", ""),
+                "description": bucket.get("description", "")[:80],
+                "matched_paths": matched,
+                "pct_of_total": round(100 * matched / total_failing, 1) if total_failing else 0,
+            })
+            all_matched_conditions.append(f"({bucket_where})")
+
+        # Count unmatched (catch-all) paths
+        if all_matched_conditions:
+            any_matched = " OR ".join(all_matched_conditions)
+            unmatched_where = f"{base_where} AND NOT ({any_matched})"
+        else:
+            unmatched_where = base_where
+
+        unmatched_count = con.execute(
+            f"SELECT COUNT(*) FROM {source} WHERE {unmatched_where}", params
+        ).fetchone()[0]
+
+        # Sample unmatched paths for debugging
+        unmatched_sample = con.execute(f"""
+            SELECT startpoint, endpoint, launch_clock, capture_clock,
+                   driver_partition, receiver_partition, int_ext, slack,
+                   clock_percentage, levels_of_logic
+            FROM {source}
+            WHERE {unmatched_where}
+            ORDER BY slack ASC
+            LIMIT 50
+        """, params)
+        sample_cols = [d[0] for d in unmatched_sample.description]
+        sample_rows = [list(r) for r in unmatched_sample.fetchall()]
+
+        return {
+            "total_failing": total_failing,
+            "total_matched_by_buckets": total_failing - unmatched_count,
+            "total_unmatched": unmatched_count,
+            "unmatched_pct": round(100 * unmatched_count / total_failing, 1) if total_failing else 0,
+            "target_pct": 5.0,
+            "meets_target": (100 * unmatched_count / total_failing) < 5.0 if total_failing else True,
+            "bucket_coverage": bucket_results,
+            "unmatched_sample": {"columns": sample_cols, "rows": sample_rows},
+            "hint": "Use the unmatched_sample to create additional buckets and re-validate." if unmatched_count > 0 else "All paths covered!",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def handle_tool_call(con, tool_name, tool_input):
     """Execute a tool call and return the result."""
     if tool_name == "query_timing_db":
@@ -703,6 +892,26 @@ def handle_tool_call(con, tool_name, tool_input):
         result = export_bucket_file(buckets, output_path, block, run_label, mode)
         console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
         console.print(f"  [dim]Load in Timing Lite: timinglite.py --bucket {result['path']} <report>[/dim]\n")
+        return json.dumps(result, default=str)
+
+    elif tool_name == "validate_buckets":
+        mode = tool_input["mode"]
+        buckets = tool_input["buckets"]
+        block = tool_input.get("block")
+        run_label = tool_input.get("run_label")
+        csv_path = tool_input.get("csv_path")
+        console.print(f"\n[dim]Validating {len(buckets)} buckets against failing paths...[/dim]\n")
+        result = validate_buckets(con, buckets, block, run_label, mode, csv_path=csv_path)
+        if "error" not in result:
+            matched = result["total_matched_by_buckets"]
+            total = result["total_failing"]
+            unmatched = result["total_unmatched"]
+            pct = result["unmatched_pct"]
+            status = "[bold green]PASS[/bold green]" if result["meets_target"] else "[bold red]FAIL[/bold red]"
+            console.print(f"  Coverage: {matched}/{total} paths matched ({100-pct:.1f}%)")
+            console.print(f"  Catch-all: {unmatched} paths ({pct}%) — target <5% — {status}")
+        else:
+            console.print(f"[red]{result['error']}[/red]")
         return json.dumps(result, default=str)
 
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
@@ -943,8 +1152,12 @@ def main():
                     f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
                     f"   - Specific root cause and Fusion Compiler recipe/floorplan action.\n"
-                    f"6. Catch-all (MSC-003) must have <5% of this partition's failing paths.\n"
-                    f"7. Call export_bucket_file to write: {output_path}\n"
+                    f"6. VALIDATE: Call validate_buckets with your bucket list to check coverage.\n"
+                    f"   It will tell you exactly how many paths each bucket matches, and show\n"
+                    f"   unmatched paths. If unmatched > 5%, analyze the unmatched_sample to find\n"
+                    f"   new patterns, add more buckets, and call validate_buckets again.\n"
+                    f"   REPEAT until unmatched < 5%. This is mandatory — do not skip validation.\n"
+                    f"7. Once validated, call export_bucket_file to write: {output_path}\n"
                     f"8. Print summary: each bucket's category, path count, worst slack, and FC recipe action."
                 )
             else:
@@ -977,9 +1190,16 @@ def main():
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
                     f"   - Map to the closest IRIS rule ID in description.\n"
                     f"   - Specific root cause and recommended fix action.\n"
-                    f"6. CRITICAL: The catch-all (MSC-003) must have FEWER than 5% of total failing paths.\n"
-                    f"   If >5% unbucketed, do ANOTHER round of query_timing_db to identify more patterns.\n"
-                    f"7. Call export_bucket_file to write the bucket file to: {output_path}\n"
+                    f"6. VALIDATE: Call validate_buckets with your complete bucket list to check coverage.\n"
+                    f"   It tests each bucket's regex filters against actual paths and reports:\n"
+                    f"   - How many paths each bucket matches\n"
+                    f"   - Total unmatched count and percentage\n"
+                    f"   - Sample of 50 unmatched paths for pattern analysis\n"
+                    f"   If unmatched > 5%, analyze the unmatched_sample, create additional buckets\n"
+                    f"   targeting those patterns, and call validate_buckets again.\n"
+                    f"   REPEAT this loop until unmatched < 5%. This is MANDATORY — do not export\n"
+                    f"   without passing validation.\n"
+                    f"7. Once validated (<5% unmatched), call export_bucket_file to write: {output_path}\n"
                     f"8. Print a triage summary: prioritize non-PTECO/non-PO_INT findings first (these need\n"
                     f"   immediate STO action), then PO_OPT, then PO_INT totals per partition."
                 )

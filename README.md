@@ -62,23 +62,28 @@ python3 agent.py -i   # interactive with pre-ingested data
 Auto-bucket failing paths and generate a timinglite-compatible bucket file:
 
 ```bash
-# Triage pre-ingested data
+# STO mode (default) — focuses on C2C/EXT paths, lumps partition internals
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
-
-# Triage any CSV on NFS — no ingest needed
 python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
 
-# Triage a specific CSV file directly
-python3 agent.py --triage --reports-dir /path/to/report_summary.max.csv.gz -m setup
+# PO mode — drills into a specific partition's internal paths
+python3 agent.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m setup
 
-# Specify output path for the bucket file
+# Specify output path
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
 ```
 
+**Persona modes:**
+| Flag | Role | Focus |
+|------|------|-------|
+| `--persona sto` (default) | Section Timing Owner | C2C and EXT paths; partition internals lumped as PO_INT |
+| `--persona po -p <partition>` | Partition Owner | Internal paths within the partition; detailed sub-buckets by logic cone, severity, FC recipe |
+
 The agent will:
 1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
-2. Classify each bucket as **PTECO** (auto-fix), **Constraints** (SDC issues), or **FCT** (manual)
-3. Generate a `.bucket` file you can load directly in Timing Lite:
+2. Classify using the IRIS waterfall: Constraints → Feedthrough → Optimization → Additional
+3. Validate bucket coverage — iterate until the catch-all (MSC-003) is under 5% of total failing paths
+4. Generate a `.bucket` file you can load directly in Timing Lite:
    ```bash
    timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
    ```

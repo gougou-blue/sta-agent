@@ -27,6 +27,7 @@ from agent import (
     load_system_prompt,
     triage_timing_run as _triage_timing_run,
     export_bucket_file as _export_bucket_file,
+    validate_buckets as _validate_buckets,
 )
 
 mcp = FastMCP(
@@ -214,6 +215,35 @@ def export_bucket_file(
     """
     result = _export_bucket_file(buckets, output_path, block, run_label, mode)
     return json.dumps(result, default=str)
+
+
+@mcp.tool()
+def validate_buckets(
+    mode: str,
+    buckets: list,
+    block: str = "",
+    run_label: str = "",
+    csv_path: str = "",
+) -> str:
+    """Validate bucket filter coverage against actual failing paths.
+
+    Tests each bucket's regex filters against the data and reports how many paths
+    each bucket matches, total unmatched (catch-all) count and percentage, and a
+    sample of unmatched paths. Use after creating buckets to verify coverage is >95%.
+
+    Args:
+        mode: 'setup' or 'hold'.
+        buckets: List of bucket dicts with keys: filters, classification, description.
+        block: Block name (for pre-ingested data).
+        run_label: Run label (for pre-ingested data).
+        csv_path: Path to CSV.gz for ad-hoc mode.
+    """
+    con = duckdb.connect(DB_PATH, read_only=True)
+    try:
+        result = _validate_buckets(con, buckets, block, run_label, mode, csv_path=csv_path or None)
+        return json.dumps(result, default=str)
+    finally:
+        con.close()
 
 
 @mcp.resource("sta://blocks")
