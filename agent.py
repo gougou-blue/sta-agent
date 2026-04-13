@@ -738,7 +738,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
     console.print(f"\n[bold]Question:[/bold] {question}\n")
 
     # Agent loop — allow multiple tool calls
-    for _ in range(10):  # safety limit
+    for _ in range(20):  # safety limit
         response = client.messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -939,15 +939,15 @@ def main():
                 f"8. Print a triage summary: each bucket's IRIS category, owner, path count, worst slack, action."
             )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
-                      model=model, reports_dir=args.reports_dir, max_tokens=16384)
+                      model=model, reports_dir=args.reports_dir, max_tokens=32768)
             # Post-triage check: did the bucket file get created?
             if os.path.isfile(output_path):
                 console.print(f"\n[bold green]\u2713 Bucket file written:[/bold green] {os.path.abspath(output_path)}")
                 console.print(f"[dim]  Load in Timing Lite: timinglite.py --bucket {os.path.abspath(output_path)} <report>[/dim]")
             else:
                 console.print(f"\n[bold yellow]\u26a0 Bucket file was NOT created at: {output_path}[/bold yellow]")
-                console.print("[yellow]  The agent may have run out of tokens before reaching the export step.")
-                console.print("  Try re-running, or use interactive mode to complete the export.[/yellow]")
+                console.print("[yellow]  The agent may have run out of tokens before reaching the export step.[/yellow]")
+                console.print("[yellow]  Try re-running, or use interactive mode to complete the export.[/yellow]")
         elif args.interactive:
             interactive_mode(con, client, model, reports_dir=args.reports_dir)
         elif args.question:
