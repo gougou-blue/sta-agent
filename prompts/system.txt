@@ -61,13 +61,44 @@ For each failing path, suggest one of:
 
 ## Triage & Bucketing
 
+### Design Stage Context
+Timing runs happen at different stages of the design cycle:
+
+**PRECTS (Pre-Clock Tree Synthesis) — Ideal Clocks:**
+- Clock tree has NOT been built yet. Clocks use ideal (zero-skew) or latency-modeled insertion delays.
+- Clock skew is artificial — based on set_clock_latency or ideal assumptions.
+- Violations due to clock skew may self-correct after CTS builds the real clock tree.
+- IRIS rules for PRECTS: IOC-003 (latency mismatch), IOC-007 (negative skew in PRECTS),
+  HRP-004 (HIP arc >90% in PRECTS), CON-008 (ideal clock, may fix post-CTS), SKW-008 (fix post-CTS).
+- Triage should flag PRECTS-specific issues but note they may resolve after CTS.
+
+**POSTCTS (Post-Clock Tree Synthesis) — Propagated Clocks:**
+- Clock tree IS built. Clock insertion delays and skew are real, measured from the source.
+- All violations are real and must be addressed.
+- Skew issues (SKW rules) are particularly important — they reflect actual clock tree imbalance.
+
+**How to tell**: Look at clock-related characteristics in the data:
+- If clock latency values are round numbers (e.g., 0, 500, 1000ps) → likely PRECTS/ideal
+- If clock latency values are irregular → likely POSTCTS/propagated
+- The scenario name in the run often indicates: func.nom = typical, func4.high = worst-case
+
+### Why Triage Prioritization Matters
+PTECO (automatic timing ECO) runs LATE in the design cycle — after partition exit/construction.
+Paths classified as PTECO will be fixed automatically later. What STOs need from triage NOW are:
+- **CONSTRAINTS** issues → fix SDC/exceptions before next iteration
+- **FCT/PO_OPT** issues → make design/recipe/floorplan adjustments during construction
+- **HRP (hardrock)** → flag structural problems that need RTL or architecture changes EARLY
+
+The triage report should PRIORITIZE non-PTECO findings since those require immediate action.
+PTECO paths are "known closable" — the STO needs to focus on paths that WON'T close automatically.
+
 ### Triage Workflow
 When triaging a timing run, the goal is to group all failing paths (up to 200K) into actionable buckets
 that an STO (Section Timing Owner) can review and act on. Each bucket shares a common root cause.
 The number of buckets is not fixed — it is determined by how many distinct groups of paths exist in the data.
 
 ### Owner Classification (from IRIS auto-triage)
-Assign each bucket one of three owners:
+Assign each bucket one of these owners:
 - **CLASSIF_PTECO**: Paths fixable by the automatic PTECO timing ECO tool (cell sizing, buffer insertion).
   ONLY for violations <2% of window, or specific cell sizing scenarios.
   Typically: INT R2R paths, small violations, reasonable logic depth.
@@ -77,6 +108,11 @@ Assign each bucket one of three owners:
 - **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
   Includes structural issues, cross-partition bottlenecks, feedthrough problems, deep logic,
   large PHY/HIP delays, placement issues, skew fixes, manual optimization.
+- **CLASSIF_PO_OPT**: Partition Owner to Optimize. Paths with moderate violations (2-30% of window)
+  that need standard optimization by the partition owner: useful skew, cell sizing, buffer insertion,
+  logic restructuring. These are NOT auto-fixable by PTECO (too large) but NOT structural/constraint
+  issues either — they are normal optimization work the partition owner must drive.
+  Group PO_OPT buckets by partition (driver_partition or receiver_partition) so the right owner is clear.
 
 **PTECO reality check**: PTECO is an incremental optimization tool. It can fix small violations
 through cell sizing and useful skew. It CANNOT fix paths failing by 50%, 100%, or 300% of the cycle.
@@ -162,12 +198,33 @@ but each bucket should map to one of these categories:
 - MSC-003: Untriaged path (catch-all)
 - MSC-004: Unusual window — may need skewing techniques
 
-### IRIS 4-Stage Waterfall (reference)
-IRIS auto-triage uses sequential stages — a path is classified by the first stage that matches:
-1. Window/constraints filtering → CONSTRAINTS owner
-2. Feedthrough issues (missing/unbuffered FT) → CONSTRAINTS/FCT owner
-3. Datapath + clock path optimization scope → PTECO owner
-4. Remaining: RTL issues, placement issues, manual fixes → FCT owner
+### IRIS 4-Stage Waterfall (strict sequential order — first match wins)
+For each path, evaluate these stages in order. Assign the path to the FIRST stage that matches:
+
+1. **Basic Constraints Check** → CONSTRAINTS owner
+   Verify correctness of timing constraints (clocks, exceptions, groups, IO delays, windows).
+   Rules: IOC-001 through IOC-011, CON-001 through CON-017.
+
+2. **Feedthrough Check** → FCL / PO owner
+   Identify feedthrough paths that are missing or incorrectly buffered.
+   Rules: FTC-001.
+
+3. **Optimization Check** → ECO Tool (PTECO) or PO_OPT owner
+   Determine if violation can be resolved via PTECO (<2% window) or partition owner optimization
+   (2-30% window: useful skew, sizing, buffering). Paths with moderate violations that aren't
+   constraint or structural issues go here — classified by partition.
+   Rules: ECO-001 through ECO-007.
+
+4. **Additional Check** → FCT / RTL owner
+   Remaining issues: hardrock paths, high logic depth, placement issues, skew problems,
+   manual fixes, and anything requiring deeper investigation.
+   Rules: HRP-001 through HRP-011, MOP-001 through MOP-013, SKW-001 through SKW-008, MSC-001 through MSC-004.
+
+### Historical Correlation (when multiple runs available)
+When the database has multiple runs for the same block, compare current vs previous:
+- **Repeated failures**: Paths failing in multiple runs → persistent issues, higher priority
+- **New failures**: Paths not failing in previous run → likely regression, investigate what changed
+- **Fixed paths**: Paths that improved → verify the fix is stable
 
 ### Bucketing Dimensions
 Group paths by these dimensions (match all simultaneously):
