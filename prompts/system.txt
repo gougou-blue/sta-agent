@@ -92,6 +92,25 @@ Paths classified as PTECO will be fixed automatically later. What STOs need from
 The triage report should PRIORITIZE non-PTECO findings since those require immediate action.
 PTECO paths are "known closable" — the STO needs to focus on paths that WON'T close automatically.
 
+### STO vs PO Roles
+- **STO (Section Timing Owner)**: Owns timing convergence at the block/section level.
+  Primary focus is on **C2C (cross-partition)** and **EXT (external/interface)** paths.
+  These are the paths that cross partition boundaries and need coordination between teams.
+- **PO (Partition Owner)**: Runs Fusion Compiler to build each partition.
+  Owns all **INT (internal)** paths within their partition.
+
+**Partition-internal paths (INT with int_ext_child=R2R, same driver_partition and receiver_partition)**
+should ALL be grouped into a single bucket per partition called "partition_internals" with
+CLASSIF_PO_INT classification. STOs don't triage these individually — they just tell the PO
+to fix them. Do NOT create detailed sub-buckets for partition-internal paths.
+
+**The STO's triage focus is:**
+1. C2C paths crossing partition boundaries (driver_partition != receiver_partition)
+2. EXT paths (int_ext = 'EXT') — interface paths to/from the block
+3. IO constraint issues on external ports
+4. Cross-clock domain paths
+5. Feedthrough paths
+
 ### Triage Workflow
 When triaging a timing run, the goal is to group all failing paths (up to 200K) into actionable buckets
 that an STO (Section Timing Owner) can review and act on. Each bucket shares a common root cause.
@@ -108,11 +127,15 @@ Assign each bucket one of these owners:
 - **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
   Includes structural issues, cross-partition bottlenecks, feedthrough problems, deep logic,
   large PHY/HIP delays, placement issues, skew fixes, manual optimization.
-- **CLASSIF_PO_OPT**: Partition Owner to Optimize. Paths with moderate violations (2-30% of window)
+- **CLASSIF_PO_OPT**: Partition Owner to Optimize. C2C/EXT paths with moderate violations (2-30% of window)
   that need standard optimization by the partition owner: useful skew, cell sizing, buffer insertion,
   logic restructuring. These are NOT auto-fixable by PTECO (too large) but NOT structural/constraint
   issues either — they are normal optimization work the partition owner must drive.
   Group PO_OPT buckets by partition (driver_partition or receiver_partition) so the right owner is clear.
+- **CLASSIF_PO_INT**: Partition Owner Internals. ALL paths that are completely internal to a partition
+  (int_ext='INT', driver_partition = receiver_partition). Create ONE bucket per partition, NOT detailed
+  sub-buckets. STOs don't triage these — they just tell the PO to fix them. Use filter like:
+  `StartPin:^<partition_name>.*&&EndPin:^<partition_name>.*`
 
 **PTECO reality check**: PTECO is an incremental optimization tool. It can fix small violations
 through cell sizing and useful skew. It CANNOT fix paths failing by 50%, 100%, or 300% of the cycle.

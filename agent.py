@@ -830,6 +830,9 @@ def main():
     parser.add_argument("--reports-dir", help="Path to a sta_pt reports directory (ad-hoc mode, no ingest needed)")
     parser.add_argument("--triage", action="store_true",
                         help="Triage mode: auto-bucket failing paths and generate a timinglite bucket file")
+    parser.add_argument("--persona", choices=["sto", "po"], default="sto",
+                        help="Triage persona: 'sto' (Section Timing Owner, focuses on C2C/EXT, default) or 'po' (Partition Owner, focuses on partition internals)")
+    parser.add_argument("--partition", "-p", help="Partition name for PO mode (e.g., pard2d1uladda1). Required when --persona po")
     parser.add_argument("--output", "-o", help="Output path for bucket file (default: ./buckets/<block>_<run>_<mode>.bucket)")
     parser.add_argument("--db", default=DB_PATH, help=f"DuckDB path (default: {DB_PATH})")
     args = parser.parse_args()
@@ -899,44 +902,87 @@ def main():
 
             block_label = args.block or os.path.basename(csv_path or 'unknown')
             run_label = args.run or csv_path or 'ad-hoc'
+            persona = args.persona or 'sto'
+            partition = args.partition
             output_path = args.output or f"./buckets/{block_label}_{args.mode}.bucket"
+
+            if persona == 'po':
+                if not partition:
+                    console.print("[red]--persona po requires --partition <partition_name>[/red]")
+                    sys.exit(1)
+                output_path = args.output or f"./buckets/{partition}_{args.mode}.bucket"
 
             csv_instruction = ""
             if csv_path:
                 csv_instruction = f"\nUse csv_path='{csv_path}' when calling triage_timing_run (ad-hoc mode, no ingest needed).\n"
 
-            triage_question = (
-                f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n"
-                f"{csv_instruction}\n"
-                f"Follow this workflow:\n"
-                f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
-                f"2. Analyze the worst 200 paths in detail — look at startpoint/endpoint hierarchical\n"
-                f"   patterns (common prefixes like ^pard2d1chnl/.*, PHY blocks, HIP cells, specific IPs).\n"
-                f"   Use query_timing_db to drill into large groups and discover sub-patterns.\n"
-                f"3. For EACH large bucket candidate group (>50 paths), use query_timing_db to find:\n"
-                f"   - Common startpoint prefixes: SELECT SUBSTRING(startpoint, 1, 40) as sp_prefix,\n"
-                f"     COUNT(*) FROM paths WHERE ... GROUP BY sp_prefix ORDER BY COUNT(*) DESC LIMIT 20\n"
-                f"   - Common endpoint prefixes: same query for endpoint\n"
-                f"   - Severity distribution: GROUP BY CASE WHEN clock_percentage > -2 THEN 'trivial'\n"
-                f"     WHEN clock_percentage > -15 THEN 'moderate' ELSE 'severe' END\n"
-                f"   - HIP/PHY-related paths, constraint issues, placement/distance issues\n"
-                f"4. Classify each bucket using the IRIS rule categories in the system prompt.\n"
-                f"   Owner types: CLASSIF_PTECO (<2% window), CLASSIF_PO_OPT (2-30% window, partition\n"
-                f"   owner optimization: sizing, skew, buffering), CLASSIF_CONSTRAINTS (SDC/clock issues),\n"
-                f"   CLASSIF_FCT (structural/RTL/floorplan).\n"
-                f"   For PO_OPT buckets, GROUP BY partition so the right partition owner is identified.\n"
-                f"5. For each bucket:\n"
-                f"   - Filters: MUST include StartPin and/or EndPin regex, not just clock groups.\n"
-                f"     Do NOT include PathType in filters — it is added automatically.\n"
-                f"   - Map to the closest IRIS rule ID in description.\n"
-                f"   - Specific root cause and recommended fix action.\n"
-                f"6. CRITICAL: The catch-all (MSC-003) must have FEWER than 5% of total failing paths.\n"
-                f"   If your initial bucketing leaves >5% unbucketed, do ANOTHER round of query_timing_db\n"
-                f"   on the remaining paths to identify more patterns. Paths with moderate violations\n"
-                f"   (2-30% of window) in specific partitions should be PO_OPT buckets, not catch-all.\n"
-                f"7. Call export_bucket_file to write the bucket file to: {output_path}\n"
-                f"8. Print a triage summary: each bucket's IRIS category, owner, path count, worst slack, action."
-            )
+            if persona == 'po':
+                triage_question = (
+                    f"Triage all failing {args.mode} paths in partition '{partition}' "
+                    f"(block '{block_label}', run '{run_label}').\n"
+                    f"{csv_instruction}\n"
+                    f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n"
+                    f"Focus ONLY on paths internal to or touching this partition.\n\n"
+                    f"Follow this workflow:\n"
+                    f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
+                    f"2. Use query_timing_db to find all failing paths in partition '{partition}':\n"
+                    f"   - Internal paths: driver_partition='{partition}' AND receiver_partition='{partition}'\n"
+                    f"   - Outgoing C2C: driver_partition='{partition}' AND receiver_partition!='{partition}'\n"
+                    f"   - Incoming C2C: driver_partition!='{partition}' AND receiver_partition='{partition}'\n"
+                    f"3. For internal paths, drill into sub-patterns:\n"
+                    f"   - Group by startpoint/endpoint prefixes to find specific logic cones\n"
+                    f"   - Identify high logic depth paths (pipeline candidates)\n"
+                    f"   - Separate by severity: <2% (PTECO fixable), 2-15% (sizing/skew), >15% (structural)\n"
+                    f"4. Use the IRIS waterfall to classify each bucket. As a PO, your actions are:\n"
+                    f"   - ECO-003/004: Cell sizing in Fusion Compiler recipe\n"
+                    f"   - MOP-001: Long net / high fanout fixes\n"
+                    f"   - MOP-008/009: Buffering strategy, clock push\n"
+                    f"   - HRP-001: High logic depth — pipeline insertion or RTL restructuring\n"
+                    f"   - HRP-006/007: Placement review for long distance paths\n"
+                    f"5. For each bucket:\n"
+                    f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
+                    f"     Do NOT include PathType in filters — it is added automatically.\n"
+                    f"   - Specific root cause and Fusion Compiler recipe/floorplan action.\n"
+                    f"6. Catch-all (MSC-003) must have <5% of this partition's failing paths.\n"
+                    f"7. Call export_bucket_file to write: {output_path}\n"
+                    f"8. Print summary: each bucket's category, path count, worst slack, and FC recipe action."
+                )
+            else:
+                triage_question = (
+                    f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n"
+                    f"{csv_instruction}\n"
+                    f"You are triaging as a SECTION TIMING OWNER (STO). Focus on C2C and EXT paths.\n\n"
+                    f"Follow this workflow:\n"
+                    f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
+                    f"2. FIRST: Separate partition-internal paths from C2C/EXT paths.\n"
+                    f"   Partition-internal = int_ext='INT' AND driver_partition = receiver_partition.\n"
+                    f"   Create ONE bucket per partition for internals with CLASSIF_PO_INT owner.\n"
+                    f"   Use filter: StartPin:^<partition_name>.*&&EndPin:^<partition_name>.*\n"
+                    f"   STOs don't triage these — PO handles them.\n"
+                    f"3. FOCUS triage on C2C and EXT paths (the STO's responsibility).\n"
+                    f"   For EACH large C2C/EXT group (>50 paths), use query_timing_db to find:\n"
+                    f"   - Common startpoint prefixes: SELECT SUBSTRING(startpoint, 1, 40) as sp_prefix,\n"
+                    f"     COUNT(*) FROM paths WHERE ... GROUP BY sp_prefix ORDER BY COUNT(*) DESC LIMIT 20\n"
+                    f"   - Common endpoint prefixes: same query for endpoint\n"
+                    f"   - Severity distribution by clock_percentage\n"
+                    f"   - HIP/PHY-related paths, constraint issues, placement/distance issues\n"
+                    f"4. Classify each C2C/EXT bucket using the IRIS waterfall (first match wins):\n"
+                    f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
+                    f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
+                    f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (moderate violations 2-30%,\n"
+                    f"     grouped by partition so the right PO is identified)\n"
+                    f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
+                    f"5. For each bucket:\n"
+                    f"   - Filters: MUST include StartPin and/or EndPin regex, not just clock groups.\n"
+                    f"     Do NOT include PathType in filters — it is added automatically.\n"
+                    f"   - Map to the closest IRIS rule ID in description.\n"
+                    f"   - Specific root cause and recommended fix action.\n"
+                    f"6. CRITICAL: The catch-all (MSC-003) must have FEWER than 5% of total failing paths.\n"
+                    f"   If >5% unbucketed, do ANOTHER round of query_timing_db to identify more patterns.\n"
+                    f"7. Call export_bucket_file to write the bucket file to: {output_path}\n"
+                    f"8. Print a triage summary: prioritize non-PTECO/non-PO_INT findings first (these need\n"
+                    f"   immediate STO action), then PO_OPT, then PO_INT totals per partition."
+                )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
             # Post-triage check: did the bucket file get created?
