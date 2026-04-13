@@ -559,7 +559,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         grp_cols = [d[0] for d in groups.description]
         grp_rows = [list(r) for r in groups.fetchall()]
 
-        # Top 200 worst paths with full detail for pattern analysis
+        # Top 50 worst paths with full detail for pattern analysis
         worst = con.execute(f"""
             SELECT
                 slack, clock_percentage, launch_clock, capture_clock,
@@ -568,17 +568,20 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             FROM {source}
             WHERE {where}
             ORDER BY slack ASC
-            LIMIT 200
+            LIMIT 50
         """, params)
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
 
+        # Limit bucket candidates to top 80 groups by path count to save tokens
+        top_grp_rows = grp_rows[:80]
+
         return {
-            "block": block or os.path.basename(csv_path),
+            "block": block or os.path.basename(csv_path).split('.')[0],
             "run_label": run_label or csv_path,
             "mode": mode,
             "summary": {"columns": sum_cols, "rows": sum_rows},
-            "bucket_candidates": {"columns": grp_cols, "rows": grp_rows, "count": len(grp_rows)},
+            "bucket_candidates": {"columns": grp_cols, "rows": top_grp_rows, "count": len(grp_rows), "shown": len(top_grp_rows)},
             "worst_paths": {"columns": worst_cols, "rows": worst_rows, "count": len(worst_rows)},
         }
     except Exception as e:
@@ -779,6 +782,15 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
         sample_cols = [d[0] for d in unmatched_sample.description]
         sample_rows = [list(r) for r in unmatched_sample.fetchall()]
 
+        # Compact bucket coverage: only show broken buckets (0 matches) and a summary line for others
+        broken_buckets = [b for b in bucket_results if b.get("matched_paths", 0) == 0]
+        working_buckets = [b for b in bucket_results if b.get("matched_paths", 0) > 0]
+        coverage_summary = [
+            {"bucket_index": b["bucket_index"], "classification": b["classification"],
+             "matched": b["matched_paths"], "pct": b.get("pct_of_total", 0)}
+            for b in working_buckets
+        ]
+
         return {
             "total_failing": total_failing,
             "total_matched_by_buckets": total_failing - unmatched_count,
@@ -786,7 +798,8 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             "unmatched_pct": round(100 * unmatched_count / total_failing, 1) if total_failing else 0,
             "target_pct": 5.0,
             "meets_target": (100 * unmatched_count / total_failing) < 5.0 if total_failing else True,
-            "bucket_coverage": bucket_results,
+            "working_buckets": coverage_summary,
+            "broken_buckets": broken_buckets,
             "unmatched_sample": {"columns": sample_cols, "rows": sample_rows},
             "hint": "Use the unmatched_sample to create additional buckets and re-validate." if unmatched_count > 0 else "All paths covered!",
         }
@@ -1109,7 +1122,7 @@ def main():
                 console.print("[red]--triage requires either (--block + --run) or --reports-dir[/red]")
                 sys.exit(1)
 
-            block_label = args.block or os.path.basename(csv_path or 'unknown')
+            block_label = args.block or os.path.basename(csv_path or 'unknown').split('.')[0]
             run_label = args.run or csv_path or 'ad-hoc'
             persona = args.persona or 'sto'
             partition = args.partition
