@@ -164,7 +164,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "triage_timing_run",
-        "description": "Analyze all failing paths (up to 200K) in a block/run and group them into bucket candidates based on clock domains, partition crossings, path types, and logic depth. Returns: a summary, all grouped bucket candidates (no limit), and the top 200 worst individual paths for pattern analysis. Use this as the first step of triage. Works with either pre-ingested data (block/run_label/mode) or ad-hoc CSV files (csv_path).",
+        "description": "Analyze all failing paths and return pre-built buckets plus summarized data for LLM classification. Returns: (1) auto_buckets — partition internals (PO_INT) and PTECO (<2% window) already bucketed, include as-is; (2) remaining_c2c_ext — C2C/EXT path groups, startpoint/endpoint prefix counts, and worst paths for you to classify into buckets. Do NOT call extra query_timing_db for drill-down — the data is pre-summarized.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -507,6 +507,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
     Works in two modes:
     - Ingested data: queries the paths table (block/run_label/mode)
     - Ad-hoc CSV: queries a CSV.gz file directly via read_csv_auto (csv_path)
+
+    For large runs (100K+ paths), auto-buckets the obvious categories in Python
+    (partition internals → PO_INT, PTECO candidates → PTECO) and returns only
+    summarized C2C/EXT data for the LLM to classify.
     """
     try:
         if csv_path:
@@ -533,56 +537,161 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         """, params)
         sum_cols = [d[0] for d in summary.description]
         sum_rows = [list(r) for r in summary.fetchall()]
+        total_failing = sum_rows[0][0] if sum_rows else 0
 
-        # Bucket candidates: group by key dimensions
-        groups = con.execute(f"""
+        # ── Auto-bucket 1: Partition internals → CLASSIF_PO_INT ──
+        po_int = con.execute(f"""
             SELECT
-                launch_clock,
-                capture_clock,
-                int_ext,
-                int_ext_child,
-                driver_partition,
-                receiver_partition,
+                driver_partition as partition,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct
+            FROM {source}
+            WHERE {where}
+              AND driver_partition = receiver_partition
+              AND (int_ext = 'INT' OR int_ext IS NULL)
+            GROUP BY driver_partition
+            ORDER BY path_count DESC
+        """, params)
+        po_int_buckets = []
+        po_int_total = 0
+        for row in po_int.fetchall():
+            part_name, count, worst_s, worst_pct = row
+            po_int_total += count
+            po_int_buckets.append({
+                "priority": 90,
+                "filters": [f"StartPin:^{part_name}.*", f"EndPin:^{part_name}.*"],
+                "classification": "CLASSIF_PO_INT",
+                "description": f"Partition-internal paths in {part_name} ({count} paths, worst {worst_s}ps) — PO action required",
+                "auto": True,
+                "path_count": count,
+            })
+
+        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2) ──
+        pteco = con.execute(f"""
+            SELECT
+                launch_clock, capture_clock,
+                driver_partition, receiver_partition,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct
+            FROM {source}
+            WHERE {where}
+              AND clock_percentage < 2
+              AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))
+            GROUP BY launch_clock, capture_clock, driver_partition, receiver_partition
+            ORDER BY path_count DESC
+        """, params)
+        pteco_buckets = []
+        pteco_total = 0
+        for row in pteco.fetchall():
+            lclk, cclk, dpart, rpart, count, worst_s, worst_pct = row
+            pteco_total += count
+            desc = f"PTECO: {lclk}->{cclk} {dpart}->{rpart} ({count} paths, worst {worst_s}ps, {worst_pct}% window)"
+            filters = [f"LaunchClk:{lclk}", f"CaptureClk:{cclk}"]
+            if dpart:
+                filters.append(f"StartPin:^{dpart}.*")
+            if rpart:
+                filters.append(f"EndPin:^{rpart}.*")
+            pteco_buckets.append({
+                "priority": 95,
+                "filters": filters,
+                "classification": "CLASSIF_PTECO",
+                "description": desc,
+                "auto": True,
+                "path_count": count,
+            })
+
+        # ── Remaining C2C/EXT paths: summarize for LLM ──
+        remaining_where = (f"{where}"
+            f" AND clock_percentage >= 2"
+            f" AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))")
+
+        remaining_count = con.execute(
+            f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
+        ).fetchone()[0]
+
+        # Top groups by clock domain + partition crossing
+        remaining_groups = con.execute(f"""
+            SELECT
+                launch_clock, capture_clock,
+                int_ext, int_ext_child,
+                driver_partition, receiver_partition,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(AVG(slack), 1) as avg_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
-                ROUND(AVG(levels_of_logic), 0) as avg_levels_of_logic,
-                MIN(levels_of_logic) as min_lol,
-                MAX(levels_of_logic) as max_lol
+                ROUND(AVG(clock_percentage), 1) as avg_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
             FROM {source}
-            WHERE {where}
+            WHERE {remaining_where}
             GROUP BY launch_clock, capture_clock, int_ext, int_ext_child,
                      driver_partition, receiver_partition
             ORDER BY path_count DESC
+            LIMIT 60
         """, params)
-        grp_cols = [d[0] for d in groups.description]
-        grp_rows = [list(r) for r in groups.fetchall()]
+        rem_grp_cols = [d[0] for d in remaining_groups.description]
+        rem_grp_rows = [list(r) for r in remaining_groups.fetchall()]
 
-        # Top 50 worst paths with full detail for pattern analysis
+        # Top startpoint prefixes in remaining paths
+        sp_prefixes = con.execute(f"""
+            SELECT
+                SUBSTRING(startpoint, 1, POSITION('/' IN startpoint || '/')) as sp_prefix,
+                COUNT(*) as cnt
+            FROM {source}
+            WHERE {remaining_where}
+            GROUP BY sp_prefix
+            ORDER BY cnt DESC
+            LIMIT 20
+        """, params)
+        sp_rows = [list(r) for r in sp_prefixes.fetchall()]
+
+        # Top endpoint prefixes in remaining paths
+        ep_prefixes = con.execute(f"""
+            SELECT
+                SUBSTRING(endpoint, 1, POSITION('/' IN endpoint || '/')) as ep_prefix,
+                COUNT(*) as cnt
+            FROM {source}
+            WHERE {remaining_where}
+            GROUP BY ep_prefix
+            ORDER BY cnt DESC
+            LIMIT 20
+        """, params)
+        ep_rows = [list(r) for r in ep_prefixes.fetchall()]
+
+        # 30 worst remaining paths for pattern analysis
         worst = con.execute(f"""
             SELECT
                 slack, clock_percentage, launch_clock, capture_clock,
-                int_ext, int_ext_child, driver_partition, receiver_partition,
+                int_ext, driver_partition, receiver_partition,
                 levels_of_logic, startpoint, endpoint
             FROM {source}
-            WHERE {where}
+            WHERE {remaining_where}
             ORDER BY slack ASC
-            LIMIT 50
+            LIMIT 30
         """, params)
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
-
-        # Limit bucket candidates to top 80 groups by path count to save tokens
-        top_grp_rows = grp_rows[:80]
 
         return {
             "block": block or os.path.basename(csv_path).split('.')[0],
             "run_label": run_label or csv_path,
             "mode": mode,
             "summary": {"columns": sum_cols, "rows": sum_rows},
-            "bucket_candidates": {"columns": grp_cols, "rows": top_grp_rows, "count": len(grp_rows), "shown": len(top_grp_rows)},
-            "worst_paths": {"columns": worst_cols, "rows": worst_rows, "count": len(worst_rows)},
+            "auto_buckets": {
+                "po_int": {"buckets": po_int_buckets, "total_paths": po_int_total},
+                "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
+                "note": "These are pre-classified. Include them as-is in your final bucket list.",
+            },
+            "remaining_c2c_ext": {
+                "total_paths": remaining_count,
+                "pct_of_total": round(100 * remaining_count / total_failing, 1) if total_failing else 0,
+                "groups": {"columns": rem_grp_cols, "rows": rem_grp_rows},
+                "startpoint_prefixes": sp_rows,
+                "endpoint_prefixes": ep_rows,
+                "worst_paths": {"columns": worst_cols, "rows": worst_rows},
+                "note": "YOU must classify these into buckets. Use the groups, prefixes, and worst paths to create filter patterns.",
+            },
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1143,78 +1252,56 @@ def main():
                     f"Triage all failing {args.mode} paths in partition '{partition}' "
                     f"(block '{block_label}', run '{run_label}').\n"
                     f"{csv_instruction}\n"
-                    f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n"
-                    f"Focus ONLY on paths internal to or touching this partition.\n\n"
+                    f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n\n"
                     f"Follow this workflow:\n"
-                    f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
-                    f"2. Use query_timing_db to find all failing paths in partition '{partition}':\n"
-                    f"   - Internal paths: driver_partition='{partition}' AND receiver_partition='{partition}'\n"
-                    f"   - Outgoing C2C: driver_partition='{partition}' AND receiver_partition!='{partition}'\n"
-                    f"   - Incoming C2C: driver_partition!='{partition}' AND receiver_partition='{partition}'\n"
-                    f"3. For internal paths, drill into sub-patterns:\n"
-                    f"   - Group by startpoint/endpoint prefixes to find specific logic cones\n"
-                    f"   - Identify high logic depth paths (pipeline candidates)\n"
-                    f"   - Separate by severity: <2% (PTECO fixable), 2-15% (sizing/skew), >15% (structural)\n"
-                    f"4. Use the IRIS waterfall to classify each bucket. As a PO, your actions are:\n"
+                    f"1. Call triage_timing_run. It returns:\n"
+                    f"   - auto_buckets: PO_INT and PTECO buckets already created by the tool\n"
+                    f"   - remaining_c2c_ext: groups, prefixes, and worst paths that YOU must classify\n"
+                    f"2. Start with ALL auto_buckets (po_int + pteco) — include them as-is.\n"
+                    f"3. For remaining paths touching partition '{partition}', classify using IRIS:\n"
                     f"   - ECO-003/004: Cell sizing in Fusion Compiler recipe\n"
                     f"   - MOP-001: Long net / high fanout fixes\n"
-                    f"   - MOP-008/009: Buffering strategy, clock push\n"
                     f"   - HRP-001: High logic depth — pipeline insertion or RTL restructuring\n"
                     f"   - HRP-006/007: Placement review for long distance paths\n"
-                    f"5. For each bucket:\n"
+                    f"4. For each new bucket:\n"
                     f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
-                    f"   - Specific root cause and Fusion Compiler recipe/floorplan action.\n"
-                    f"6. VALIDATE: Call validate_buckets with your bucket list to check coverage.\n"
-                    f"   It will tell you exactly how many paths each bucket matches, and show\n"
-                    f"   unmatched paths. If unmatched > 5%, analyze the unmatched_sample to find\n"
-                    f"   new patterns, add more buckets, and call validate_buckets again.\n"
-                    f"   REPEAT until unmatched < 5%. This is mandatory — do not skip validation.\n"
-                    f"7. Once validated, call export_bucket_file to write: {output_path}\n"
-                    f"8. Print summary: each bucket's category, path count, worst slack, and FC recipe action."
+                    f"   - Specific root cause and FC recipe action.\n"
+                    f"5. VALIDATE: Call validate_buckets with ALL buckets (auto + yours).\n"
+                    f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
+                    f"   MAX 2 validation rounds — then export.\n"
+                    f"6. Call export_bucket_file with ALL buckets to write: {output_path}\n"
+                    f"7. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
                 triage_question = (
                     f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n"
                     f"{csv_instruction}\n"
-                    f"You are triaging as a SECTION TIMING OWNER (STO). Focus on C2C and EXT paths.\n\n"
+                    f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
                     f"Follow this workflow:\n"
-                    f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
-                    f"2. FIRST: Separate partition-internal paths from C2C/EXT paths.\n"
-                    f"   Partition-internal = int_ext='INT' AND driver_partition = receiver_partition.\n"
-                    f"   Create ONE bucket per partition for internals with CLASSIF_PO_INT owner.\n"
-                    f"   Use filter: StartPin:^<partition_name>.*&&EndPin:^<partition_name>.*\n"
-                    f"   STOs don't triage these — PO handles them.\n"
-                    f"3. FOCUS triage on C2C and EXT paths (the STO's responsibility).\n"
-                    f"   For EACH large C2C/EXT group (>50 paths), use query_timing_db to find:\n"
-                    f"   - Common startpoint prefixes: SELECT SUBSTRING(startpoint, 1, 40) as sp_prefix,\n"
-                    f"     COUNT(*) FROM paths WHERE ... GROUP BY sp_prefix ORDER BY COUNT(*) DESC LIMIT 20\n"
-                    f"   - Common endpoint prefixes: same query for endpoint\n"
-                    f"   - Severity distribution by clock_percentage\n"
-                    f"   - HIP/PHY-related paths, constraint issues, placement/distance issues\n"
+                    f"1. Call triage_timing_run. It returns:\n"
+                    f"   - auto_buckets.po_int: partition-internal buckets (CLASSIF_PO_INT) — pre-built\n"
+                    f"   - auto_buckets.pteco: PTECO candidates (<2% window) — pre-built\n"
+                    f"   - remaining_c2c_ext: C2C/EXT groups, prefixes, and worst paths for YOU to classify\n"
+                    f"2. Start with ALL auto_buckets (po_int + pteco) — include them as-is in your final list.\n"
+                    f"3. Focus on remaining_c2c_ext. Use the groups and prefix data to create buckets.\n"
+                    f"   Do NOT call extra query_timing_db — the data is already summarized for you.\n"
                     f"4. Classify each C2C/EXT bucket using the IRIS waterfall (first match wins):\n"
                     f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
                     f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
-                    f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (moderate violations 2-30%,\n"
-                    f"     grouped by partition so the right PO is identified)\n"
+                    f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (2-30% window, by partition)\n"
                     f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
                     f"5. For each bucket:\n"
-                    f"   - Filters: MUST include StartPin and/or EndPin regex, not just clock groups.\n"
+                    f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
                     f"   - Map to the closest IRIS rule ID in description.\n"
                     f"   - Specific root cause and recommended fix action.\n"
-                    f"6. VALIDATE: Call validate_buckets with your complete bucket list to check coverage.\n"
-                    f"   It tests each bucket's regex filters against actual paths and reports:\n"
-                    f"   - How many paths each bucket matches\n"
-                    f"   - Total unmatched count and percentage\n"
-                    f"   - Sample of unmatched paths for pattern analysis\n"
-                    f"   If unmatched > 5%, analyze the unmatched_sample, create additional buckets\n"
-                    f"   targeting those patterns, and call validate_buckets again.\n"
-                    f"   MAX 2 validation rounds — after 2 rounds, export with current buckets.\n"
-                    f"   Do not skip validation, but do not loop forever.\n"
-                    f"7. Once validated or after 2 rounds, call export_bucket_file to write: {output_path}\n"
-                    f"8. Print a triage summary: prioritize non-PTECO/non-PO_INT findings first (these need\n"
-                    f"   immediate STO action), then PO_OPT, then PO_INT totals per partition."
+                    f"6. VALIDATE: Call validate_buckets with ALL buckets (auto + yours).\n"
+                    f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
+                    f"   MAX 2 validation rounds — then export.\n"
+                    f"7. Call export_bucket_file with ALL buckets to write: {output_path}\n"
+                    f"8. Print triage summary: C2C/EXT findings first (STO action needed),\n"
+                    f"   then PO_OPT, then PO_INT totals per partition, then PTECO."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
