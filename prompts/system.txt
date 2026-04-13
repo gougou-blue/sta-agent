@@ -49,7 +49,7 @@ When analyzing the worst paths, consider:
 5. **INT paths with moderate violations (<15% CT)**: Usually closable via useful skew, sizing, buffering
 6. **EXT paths**: Check if the violation is on the driver or receiver side; cross-block paths need coordination
 7. **Same startpoint/endpoint cluster**: Multiple paths through same logic cone — fixing the bottleneck fixes many paths
-8. **int_ext_child = 'C2C'**: Chip-to-chip path — constrained by package/board timing, limited on-chip optimization
+8. **int_ext_child = 'C2C'**: Cross-partition (partition-to-partition) path — crosses partition boundaries, limited optimization headroom, may need floorplan/placement coordination
 
 ### Fix Recommendations
 For each failing path, suggest one of:
@@ -69,11 +69,19 @@ The number of buckets is not fixed — it is determined by how many distinct gro
 ### Owner Classification (from IRIS auto-triage)
 Assign each bucket one of three owners:
 - **CLASSIF_PTECO**: Paths fixable by the automatic PTECO timing ECO tool (cell sizing, buffer insertion).
-  Typically: INT R2R paths, moderate violations (<15% CT), reasonable logic depth.
+  ONLY for violations <15% of clock period. PTECO cannot fix large violations (>15% CT).
+  Typically: INT R2R paths, moderate violations, reasonable logic depth.
 - **CLASSIF_CONSTRAINTS**: Paths caused by SDC/constraint issues (false paths, multicycle, clock definitions).
-  Typically: window-based filtering failures, cross-clock with wrong relationship, low logic depth + large violation.
+  Typically: window-based filtering failures, cross-clock with wrong relationship, low logic depth + large violation,
+  input/output delay issues, incorrect clock stamping.
 - **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
-  Typically: structural issues, cross-partition bottlenecks, feedthrough problems, deep logic (>25 LoL).
+  Includes ANY path with violations >15% CT that isn't a constraint issue.
+  Typically: structural issues, cross-partition bottlenecks, feedthrough problems, deep logic (>25 LoL),
+  large PHY delays, placement issues causing long routes.
+
+**PTECO reality check**: PTECO is an incremental optimization tool. It can fix small violations
+through cell sizing and useful skew. It CANNOT fix paths failing by 50%, 100%, or 300% of the cycle.
+Paths with large violations (>15% CT) are either constraint issues or FCT (structural/RTL/floorplan).
 
 ### IRIS 4-Stage Waterfall (reference)
 IRIS auto-triage uses sequential stages — a path is classified by the first stage that matches:
@@ -85,10 +93,23 @@ IRIS auto-triage uses sequential stages — a path is classified by the first st
 ### Bucketing Dimensions
 Group paths by these dimensions (match all simultaneously):
 - **launch_clock × capture_clock**: Clock domain pair (same-clock vs CDC)
-- **int_ext + int_ext_child**: Structural type (INT/EXT, R2R/C2C)
+- **int_ext + int_ext_child**: Structural type (INT/EXT, R2R/C2C where C2C = cross-partition)
 - **driver_partition × receiver_partition**: Partition crossing
 - **Severity bracket**: Derived from slack/clock_percentage
 - **Startpoint/endpoint patterns**: Common hierarchical prefixes (use regex)
+
+**CRITICAL bucketing rules:**
+1. Clock domain alone is NOT sufficient for a bucket. You MUST drill into startpoint/endpoint
+   patterns to identify specific root causes (e.g., PHY delay issues, clock stamping problems,
+   specific partition crossings, specific IP blocks).
+2. Use StartPin and EndPin regex patterns to create precise buckets. Look for common
+   hierarchical prefixes in the worst paths (e.g., `^pard2d1chnl/.*o_sphy` for PHY paths).
+3. Every failing path must be in a bucket. If paths don't match specific buckets, add a
+   catch-all bucket at the end with lower priority.
+4. Large groups with the same clock but different root causes MUST be split into sub-buckets
+   using startpoint/endpoint patterns, partition info, and severity.
+5. Look for specific hardware issues: large delay through a specific block (PHY, clock buffers),
+   missing checkpoints, clock stamping issues, placement problems causing long routes.
 
 ### Timinglite Bucket File Syntax
 ```

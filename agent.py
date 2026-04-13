@@ -582,8 +582,10 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
 
     for bucket in buckets:
         priority = bucket.get("priority", 1)
-        raw_filters = [f"PathType:{path_type}"] + bucket.get("filters", [])
-        filters = [_sanitize_filter_regex(f) for f in raw_filters]
+        raw_filters = bucket.get("filters", [])
+        # Remove any PathType filters provided by Claude (we add it ourselves)
+        raw_filters = [f for f in raw_filters if not f.startswith("PathType:")]
+        filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
         classification = bucket.get("classification", "")
         description = bucket.get("description", "").replace("\n", " ")
 
