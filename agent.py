@@ -774,7 +774,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             FROM {source}
             WHERE {unmatched_where}
             ORDER BY slack ASC
-            LIMIT 50
+            LIMIT 30
         """, params)
         sample_cols = [d[0] for d in unmatched_sample.description]
         sample_rows = [list(r) for r in unmatched_sample.fetchall()]
@@ -1194,12 +1194,12 @@ def main():
                     f"   It tests each bucket's regex filters against actual paths and reports:\n"
                     f"   - How many paths each bucket matches\n"
                     f"   - Total unmatched count and percentage\n"
-                    f"   - Sample of 50 unmatched paths for pattern analysis\n"
+                    f"   - Sample of unmatched paths for pattern analysis\n"
                     f"   If unmatched > 5%, analyze the unmatched_sample, create additional buckets\n"
                     f"   targeting those patterns, and call validate_buckets again.\n"
-                    f"   REPEAT this loop until unmatched < 5%. This is MANDATORY — do not export\n"
-                    f"   without passing validation.\n"
-                    f"7. Once validated (<5% unmatched), call export_bucket_file to write: {output_path}\n"
+                    f"   MAX 2 validation rounds — after 2 rounds, export with current buckets.\n"
+                    f"   Do not skip validation, but do not loop forever.\n"
+                    f"7. Once validated or after 2 rounds, call export_bucket_file to write: {output_path}\n"
                     f"8. Print a triage summary: prioritize non-PTECO/non-PO_INT findings first (these need\n"
                     f"   immediate STO action), then PO_OPT, then PO_INT totals per partition."
                 )
