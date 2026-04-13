@@ -788,17 +788,21 @@ def _csv_source_with_aliases(con, csv_path):
     raw_src = f"read_csv_auto('{csv_path}')"
     col_check = con.execute(f"SELECT * FROM {raw_src} LIMIT 0")
     csv_cols = {d[0].lower() for d in col_check.description}
+    csv_types = {d[0].lower(): d[1] for d in col_check.description}
 
-    def col_or_null(standard, *alternatives):
+    def col_or_null(standard, *alternatives, cast_to=None):
         for alt in (standard,) + alternatives:
             if alt in csv_cols:
-                return f'"{alt}" AS {standard}'
+                expr = f'"{alt}"'
+                if cast_to and csv_types.get(alt, '').upper() == 'VARCHAR':
+                    expr = f'TRY_CAST("{alt}" AS {cast_to})'
+                return f'{expr} AS {standard}'
         return f"NULL AS {standard}"
 
     aliases = [
-        col_or_null("slack", "normal_slack"),
-        col_or_null("clock_percentage"),
-        col_or_null("period"),
+        col_or_null("slack", "normal_slack", cast_to="DOUBLE"),
+        col_or_null("clock_percentage", cast_to="DOUBLE"),
+        col_or_null("period", cast_to="DOUBLE"),
         col_or_null("startpoint"),
         col_or_null("endpoint"),
         col_or_null("launch_clock", "start_clock"),
@@ -808,7 +812,7 @@ def _csv_source_with_aliases(con, csv_path):
         col_or_null("int_ext_child"),
         col_or_null("driver_partition"),
         col_or_null("receiver_partition"),
-        col_or_null("levels_of_logic"),
+        col_or_null("levels_of_logic", cast_to="INTEGER"),
         col_or_null("path_type"),
     ]
     return f"(SELECT {', '.join(aliases)} FROM {raw_src}) AS csv_data"
