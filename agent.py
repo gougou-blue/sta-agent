@@ -535,6 +535,30 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         return {"error": str(e)}
 
 
+def _sanitize_filter_regex(filter_str):
+    """Fix common regex issues in timinglite filter values.
+
+    Timinglite uses re2 which rejects bare * (no preceding char).
+    Convert glob-style patterns to valid regex.
+    """
+    # Split on : to get column:value
+    if ':' not in filter_str:
+        return filter_str
+    col, val = filter_str.split(':', 1)
+
+    # Fix bare * at start of value (glob) → .* (regex)
+    if val.startswith('*'):
+        val = '.' + val
+    # Fix *something → .*something anywhere after start
+    val = re.sub(r'(?<!\.)\*', '.*', val)
+    # Fix ** → .* (double-glob)
+    val = val.replace('.**', '.*')
+    # Remove trailing bare * that became .* redundantly after .*
+    val = re.sub(r'(\.\*)+', '.*', val)
+
+    return f"{col}:{val}"
+
+
 def export_bucket_file(buckets, output_path, block, run_label, mode):
     """Write a timinglite-compatible bucket file.
 
@@ -558,7 +582,8 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
 
     for bucket in buckets:
         priority = bucket.get("priority", 1)
-        filters = [f"PathType:{path_type}"] + bucket.get("filters", [])
+        raw_filters = [f"PathType:{path_type}"] + bucket.get("filters", [])
+        filters = [_sanitize_filter_regex(f) for f in raw_filters]
         classification = bucket.get("classification", "")
         description = bucket.get("description", "").replace("\n", " ")
 

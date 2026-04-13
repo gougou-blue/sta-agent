@@ -103,6 +103,13 @@ Group paths by these dimensions (match all simultaneously):
 - `#INCLUDE <path>` imports shared bucket files
 - Column name mapping: launch_clock→LaunchClk, capture_clock→CaptureClk,
   startpoint→StartPin, endpoint→EndPin, clock_percentage→PercentPeriod, path_type→PathType
+
+**CRITICAL regex rules (timinglite uses re2):**
+- NEVER use bare `*` — always use `.*` for wildcards (e.g., `StartPin:^pard2d1.*` not `StartPin:pard2d1*`)
+- Use `^` to anchor at the start of the string
+- Use `.*` between hierarchy levels: `StartPin:^pard2d1chnl/.*o_sphy`
+- Valid examples: `LaunchClk:uclk_mem`, `StartPin:^pard2d1chnl/.*`, `PercentPeriod:>-30`
+- Invalid examples: `StartPin:*pard2d1` (bare *), `EndPin:par*` (bare *)
 - **Floorplan/partition escalation**: Cross-partition paths with large violations
 - **Budget renegotiation**: EXT paths where the allocated timing budget is insufficient
 - **Investigation needed**: Paths that don't fit standard patterns — may be a tool or data issue
