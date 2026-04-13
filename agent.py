@@ -739,13 +739,14 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
 
     # Agent loop — allow multiple tool calls
     for _ in range(20):  # safety limit
-        response = client.messages.create(
+        with client.messages.stream(
             model=model,
             max_tokens=max_tokens,
             system=system_prompt,
             tools=TOOL_SCHEMA,
             messages=messages,
-        )
+        ) as stream:
+            response = stream.get_final_message()
 
         # Process response content blocks
         tool_results = []
