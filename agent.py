@@ -788,13 +788,13 @@ def _csv_source_with_aliases(con, csv_path):
     raw_src = f"read_csv_auto('{csv_path}')"
     col_check = con.execute(f"SELECT * FROM {raw_src} LIMIT 0")
     csv_cols = {d[0].lower() for d in col_check.description}
-    csv_types = {d[0].lower(): d[1] for d in col_check.description}
+    csv_types = {d[0].lower(): str(d[1]) for d in col_check.description}
 
     def col_or_null(standard, *alternatives, cast_to=None):
         for alt in (standard,) + alternatives:
             if alt in csv_cols:
                 expr = f'"{alt}"'
-                if cast_to and csv_types.get(alt, '').upper() == 'VARCHAR':
+                if cast_to and 'VARCHAR' in csv_types.get(alt, '').upper():
                     expr = f'TRY_CAST("{alt}" AS {cast_to})'
                 return f'{expr} AS {standard}'
         return f"NULL AS {standard}"
