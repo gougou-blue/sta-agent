@@ -57,6 +57,29 @@ python3 agent.py "which clock domains have the most hold violations?"
 python3 agent.py -i   # interactive with pre-ingested data
 ```
 
+### Triage a timing run
+
+Auto-bucket failing paths and generate a timinglite-compatible bucket file:
+
+```bash
+# Triage setup violations for d2d1
+python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
+
+# Specify output path for the bucket file
+python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
+
+# Triage hold violations
+python3 agent.py --triage -b d2d4 -r 26ww15.2 -m hold
+```
+
+The agent will:
+1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
+2. Classify each bucket as **PTECO** (auto-fix), **Constraints** (SDC issues), or **FCT** (manual)
+3. Generate a `.bucket` file you can load directly in Timing Lite:
+   ```bash
+   timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
+   ```
+
 ## What it can do
 
 - **Path analysis**: Worst paths, root cause identification, fix recommendations
@@ -64,6 +87,7 @@ python3 agent.py -i   # interactive with pre-ingested data
 - **Report reading**: Timing loops, max transition, QoR, constraints, untested paths
 - **Trend analysis**: Violations across work weeks (with pre-ingested data)
 - **Ad-hoc queries**: SQL against any CSV.gz on NFS via DuckDB
+- **Triage & bucketing**: Auto-group failing paths into actionable buckets, generate timinglite bucket files
 
 ## Architecture
 
@@ -78,6 +102,50 @@ prompts/system.txt  — STA domain knowledge and analysis guidelines
 
 GNAI tokens expire periodically. Visit https://gnai.intel.com/auth/oauth2/sso to get a fresh one.
 
+## VS Code Integration
+
+### Option 1: VS Code Tasks (quick start)
+
+Run the agent directly from VS Code without leaving the editor:
+
+1. Open the sta-agent folder in VS Code
+2. Press `Ctrl+Shift+P` → **Tasks: Run Task**
+3. Pick one:
+   - **STA Agent: Ask Question** — prompts for a one-shot question
+   - **STA Agent: Interactive Mode** — starts the interactive REPL in the terminal
+   - **STA Agent: Analyze Reports Dir** — prompts for an NFS reports path, then starts interactive mode
+
+Make sure `GNAI_API_KEY` is set in your shell/environment before launching VS Code.
+
+### Option 2: MCP Server (Copilot Chat integration)
+
+Ask STA questions directly in GitHub Copilot Chat — no terminal needed:
+
+1. Install the MCP dependency:
+   ```bash
+   pip install mcp
+   ```
+
+2. The `.vscode/mcp.json` is already configured. VS Code will auto-detect it.
+
+3. In Copilot Chat, the STA tools become available automatically. Ask questions like:
+   - *"List the available timing data in the database"*
+   - *"Query the worst 10 setup paths in d2d1"*
+   - *"Read the timing loop report for d2d4 26ww15.2"*
+
+   Copilot will call `query_timing_db`, `list_reports`, `read_report`, etc. on your behalf.
+
+**Available MCP tools:**
+| Tool | Description |
+|------|-------------|
+| `query_timing_db` | SQL against the pre-ingested DuckDB paths table |
+| `query_csv` | SQL against any CSV.gz on NFS via `read_csv_auto()` |
+| `list_available_data` | Show all blocks/runs in the database |
+| `list_reports` | List .rpt.gz/.csv.gz files in a reports directory |
+| `read_report` | Read a PrimeTime report with head/tail/grep |
+| `triage_timing_run` | Analyze failing paths and group into bucket candidates |
+| `export_bucket_file` | Generate a timinglite-compatible bucket file |
+
 ## Feedback
 
-Report issues or suggestions to jymarc@intel.com
+Report issues or suggestions to jean.marc@intel.com

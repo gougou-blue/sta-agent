@@ -58,6 +58,51 @@ For each failing path, suggest one of:
 - **CTS adjustment**: Clock skew rebalancing (hold violations, same-clock paths)
 - **Hold buffer insertion**: Standard fix for hold violations <300ps
 - **Constraint review**: Check if the path is a false path or multicycle path candidate
+
+## Triage & Bucketing
+
+### Triage Workflow
+When triaging a timing run, the goal is to group all failing paths (up to 200K) into actionable buckets
+that an STO (Section Timing Owner) can review and act on. Each bucket shares a common root cause.
+The number of buckets is not fixed — it is determined by how many distinct groups of paths exist in the data.
+
+### Owner Classification (from IRIS auto-triage)
+Assign each bucket one of three owners:
+- **CLASSIF_PTECO**: Paths fixable by the automatic PTECO timing ECO tool (cell sizing, buffer insertion).
+  Typically: INT R2R paths, moderate violations (<15% CT), reasonable logic depth.
+- **CLASSIF_CONSTRAINTS**: Paths caused by SDC/constraint issues (false paths, multicycle, clock definitions).
+  Typically: window-based filtering failures, cross-clock with wrong relationship, low logic depth + large violation.
+- **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
+  Typically: structural issues, cross-partition bottlenecks, feedthrough problems, deep logic (>25 LoL).
+
+### IRIS 4-Stage Waterfall (reference)
+IRIS auto-triage uses sequential stages — a path is classified by the first stage that matches:
+1. Window/constraints filtering → CONSTRAINTS owner
+2. Feedthrough issues (missing/unbuffered FT) → CONSTRAINTS/FCT owner
+3. Datapath + clock path optimization scope → PTECO owner
+4. Remaining: RTL issues, placement issues, manual fixes → FCT owner
+
+### Bucketing Dimensions
+Group paths by these dimensions (match all simultaneously):
+- **launch_clock × capture_clock**: Clock domain pair (same-clock vs CDC)
+- **int_ext + int_ext_child**: Structural type (INT/EXT, R2R/C2C)
+- **driver_partition × receiver_partition**: Partition crossing
+- **Severity bracket**: Derived from slack/clock_percentage
+- **Startpoint/endpoint patterns**: Common hierarchical prefixes (use regex)
+
+### Timinglite Bucket File Syntax
+```
+<priority> <filter>&&<filter>... <CLASSIFICATION> <description>
+```
+- Filters: `PathType:max`, `LaunchClk:<regex>`, `CaptureClk:<regex>`, `StartPin:<regex>`,
+  `EndPin:<regex>`, `PercentPeriod:>-30`
+- Filters are joined with `&&` (AND logic)
+- Classification tags: `CLASSIF_PTECO`, `CLASSIF_CONSTRAINTS`, `CLASSIF_FCT`
+- Description: plain text root cause + recommended fix
+- Comments start with `#`
+- `#INCLUDE <path>` imports shared bucket files
+- Column name mapping: launch_clock→LaunchClk, capture_clock→CaptureClk,
+  startpoint→StartPin, endpoint→EndPin, clock_percentage→PercentPeriod, path_type→PathType
 - **Floorplan/partition escalation**: Cross-partition paths with large violations
 - **Budget renegotiation**: EXT paths where the allocated timing budget is insufficient
 - **Investigation needed**: Paths that don't fit standard patterns — may be a tool or data issue

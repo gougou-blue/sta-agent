@@ -26,6 +26,8 @@ import re
 import sys
 import textwrap
 
+from datetime import datetime
+
 import anthropic
 import duckdb
 from rich.console import Console
@@ -158,6 +160,83 @@ TOOL_SCHEMA = [
                     "description": "Number of lines of context around grep matches (default 2)."
                 }
             },
+        }
+    },
+    {
+        "name": "triage_timing_run",
+        "description": "Analyze all failing paths (up to 200K) in a block/run and group them into bucket candidates based on clock domains, partition crossings, path types, and logic depth. Returns: a summary, all grouped bucket candidates (no limit), and the top 200 worst individual paths for pattern analysis. Use this as the first step of triage.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "block": {
+                    "type": "string",
+                    "description": "Block name (e.g., d2d1)"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label (e.g., 26ww14.3)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold"
+                }
+            },
+            "required": ["block", "run_label", "mode"]
+        }
+    },
+    {
+        "name": "export_bucket_file",
+        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), an owner classification, and a root cause description. The bucket file can be loaded directly in Timing Lite.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "block": {
+                    "type": "string",
+                    "description": "Block name"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold"
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "File path to write the bucket file (e.g., ./buckets/d2d1_26ww14.3_setup.bucket)"
+                },
+                "buckets": {
+                    "type": "array",
+                    "description": "List of bucket definitions",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "priority": {
+                                "type": "integer",
+                                "description": "Bucket priority (1 = highest)"
+                            },
+                            "filters": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Filter expressions in timinglite syntax: LaunchClk:<regex>, CaptureClk:<regex>, StartPin:<regex>, EndPin:<regex>, PercentPeriod:<comparison>"
+                            },
+                            "classification": {
+                                "type": "string",
+                                "description": "Owner: CLASSIF_PTECO (auto-fix), CLASSIF_CONSTRAINTS (SDC issues), or CLASSIF_FCT (manual RTL/floorplan)"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Root cause analysis and recommended fix action"
+                            }
+                        },
+                        "required": ["filters", "classification", "description"]
+                    }
+                }
+            },
+            "required": ["block", "run_label", "mode", "output_path", "buckets"]
         }
     },
 ]
@@ -368,6 +447,117 @@ def read_report_file(block=None, run_label=None, mode=None, report_name=None,
         }
 
 
+def triage_timing_run(con, block, run_label, mode):
+    """Analyze failing paths and group into triage bucket candidates."""
+    try:
+        # Overall summary
+        summary = con.execute("""
+            SELECT
+                COUNT(*) as total_failing,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                COUNT(DISTINCT launch_clock || ' -> ' || capture_clock) as clock_domain_pairs,
+                COUNT(DISTINCT driver_partition || ' -> ' || receiver_partition) as partition_crossings
+            FROM paths
+            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
+        """, [block, run_label, mode])
+        sum_cols = [d[0] for d in summary.description]
+        sum_rows = [list(r) for r in summary.fetchall()]
+
+        # Bucket candidates: group by key dimensions
+        groups = con.execute("""
+            SELECT
+                launch_clock,
+                capture_clock,
+                int_ext,
+                int_ext_child,
+                driver_partition,
+                receiver_partition,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_levels_of_logic,
+                MIN(levels_of_logic) as min_lol,
+                MAX(levels_of_logic) as max_lol
+            FROM paths
+            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
+            GROUP BY launch_clock, capture_clock, int_ext, int_ext_child,
+                     driver_partition, receiver_partition
+            ORDER BY path_count DESC
+        """, [block, run_label, mode])
+        grp_cols = [d[0] for d in groups.description]
+        grp_rows = [list(r) for r in groups.fetchall()]
+
+        # Top 200 worst paths with full detail for pattern analysis
+        worst = con.execute("""
+            SELECT
+                slack, clock_percentage, launch_clock, capture_clock,
+                int_ext, int_ext_child, driver_partition, receiver_partition,
+                levels_of_logic, startpoint, endpoint
+            FROM paths
+            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
+            ORDER BY slack ASC
+            LIMIT 200
+        """, [block, run_label, mode])
+        worst_cols = [d[0] for d in worst.description]
+        worst_rows = [list(r) for r in worst.fetchall()]
+
+        return {
+            "block": block,
+            "run_label": run_label,
+            "mode": mode,
+            "summary": {"columns": sum_cols, "rows": sum_rows},
+            "bucket_candidates": {"columns": grp_cols, "rows": grp_rows, "count": len(grp_rows)},
+            "worst_paths": {"columns": worst_cols, "rows": worst_rows, "count": len(worst_rows)},
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def export_bucket_file(buckets, output_path, block, run_label, mode):
+    """Write a timinglite-compatible bucket file.
+
+    Args:
+        buckets: list of dicts with keys: priority, filters, classification, description
+        output_path: path to write the bucket file
+        block: block name
+        run_label: run label
+        mode: setup or hold
+    """
+    lines = [
+        f"# STA Agent Auto-Triage Bucket File",
+        f"# Block: {block}  Run: {run_label}  Mode: {mode}",
+        f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"#",
+        f"# Load in Timing Lite: timinglite.py --bucket <this_file> <report>",
+        f"#",
+    ]
+
+    path_type = "max" if mode == "setup" else "min"
+
+    for bucket in buckets:
+        priority = bucket.get("priority", 1)
+        filters = [f"PathType:{path_type}"] + bucket.get("filters", [])
+        classification = bucket.get("classification", "")
+        description = bucket.get("description", "").replace("\n", " ")
+
+        filter_str = "&&".join(filters)
+        lines.append(f"{priority} {filter_str} {classification} {description}")
+
+    content = "\n".join(lines) + "\n"
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, 'w') as f:
+        f.write(content)
+
+    return {
+        "path": os.path.abspath(output_path),
+        "bucket_count": len(buckets),
+        "content": content,
+    }
+
+
 def handle_tool_call(con, tool_name, tool_input):
     """Execute a tool call and return the result."""
     if tool_name == "query_timing_db":
@@ -436,6 +626,34 @@ def handle_tool_call(con, tool_name, tool_input):
             console.print(f"[red]{result['error']}[/red]")
         else:
             console.print(f"[dim]({result['total_lines']} total lines)[/dim]")
+        return json.dumps(result, default=str)
+
+    elif tool_name == "triage_timing_run":
+        block = tool_input["block"]
+        run_label = tool_input["run_label"]
+        mode = tool_input["mode"]
+        console.print(f"\n[dim]Triaging {block}/{run_label} ({mode})...[/dim]\n")
+        result = triage_timing_run(con, block, run_label, mode)
+        if "error" not in result:
+            summary = result["summary"]["rows"][0] if result["summary"]["rows"] else []
+            if summary:
+                console.print(f"  [bold]{summary[0]}[/bold] failing paths, worst slack: [red]{summary[1]}ps[/red]")
+                console.print(f"  {summary[3]} clock domain pairs, {summary[4]} partition crossings")
+            console.print(f"  {result['bucket_candidates']['count']} bucket candidates identified\n")
+        else:
+            console.print(f"[red]{result['error']}[/red]")
+        return json.dumps(result, default=str)
+
+    elif tool_name == "export_bucket_file":
+        block = tool_input["block"]
+        run_label = tool_input["run_label"]
+        mode = tool_input["mode"]
+        output_path = tool_input["output_path"]
+        buckets = tool_input["buckets"]
+        console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]\n")
+        result = export_bucket_file(buckets, output_path, block, run_label, mode)
+        console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
+        console.print(f"  [dim]Load in Timing Lite: timinglite.py --bucket {result['path']} <report>[/dim]\n")
         return json.dumps(result, default=str)
 
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
@@ -550,6 +768,7 @@ def main():
         epilog="Examples:\n"
                "  python agent.py 'top 10 worst setup paths in d2d1'\n"
                "  python agent.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
+               "  python agent.py --triage -b d2d1 -r 26ww14.3 -m setup\n"
                "  python agent.py -i\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -559,6 +778,9 @@ def main():
     parser.add_argument("--run", "-r", help="Focus on a specific run")
     parser.add_argument("--mode", "-m", choices=["setup", "hold"], help="Focus on setup or hold")
     parser.add_argument("--reports-dir", help="Path to a sta_pt reports directory (ad-hoc mode, no ingest needed)")
+    parser.add_argument("--triage", action="store_true",
+                        help="Triage mode: auto-bucket failing paths and generate a timinglite bucket file")
+    parser.add_argument("--output", "-o", help="Output path for bucket file (default: ./buckets/<block>_<run>_<mode>.bucket)")
     parser.add_argument("--db", default=DB_PATH, help=f"DuckDB path (default: {DB_PATH})")
     args = parser.parse_args()
 
@@ -600,7 +822,30 @@ def main():
         console.print("[dim]Using direct Anthropic API[/dim]")
 
     try:
-        if args.interactive:
+        if args.triage:
+            if not all([args.block, args.run, args.mode]):
+                console.print("[red]--triage requires --block, --run, and --mode[/red]")
+                sys.exit(1)
+            output_path = args.output or f"./buckets/{args.block}_{args.run}_{args.mode}.bucket"
+            triage_question = (
+                f"Triage all failing {args.mode} paths in block '{args.block}', run '{args.run}'.\n\n"
+                f"Follow this workflow:\n"
+                f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
+                f"2. Analyze the groups — identify root cause patterns, merge small groups that share \n"
+                f"   the same root cause, split large groups with distinct sub-patterns.\n"
+                f"   The number of final buckets is determined by the data — do not target a fixed number.\n"
+                f"3. For each final bucket, determine:\n"
+                f"   - Owner: CLASSIF_PTECO (timing ECO auto-fix), CLASSIF_CONSTRAINTS (SDC/constraint issues), "
+                f"or CLASSIF_FCT (RTL/floorplan/manual fixes)\n"
+                f"   - Filters using timinglite syntax (LaunchClk, CaptureClk, StartPin, EndPin with regex, "
+                f"PercentPeriod with comparison)\n"
+                f"   - Root cause description and recommended fix.\n"
+                f"4. Call export_bucket_file to write the bucket file to: {output_path}\n"
+                f"5. Print a triage summary: each bucket's owner, path count, worst slack, and action."
+            )
+            run_agent(con, client, triage_question, args.block, args.run, args.mode,
+                      model=model, reports_dir=args.reports_dir)
+        elif args.interactive:
             interactive_mode(con, client, model, reports_dir=args.reports_dir)
         elif args.question:
             run_agent(con, client, args.question, args.block, args.run, args.mode,

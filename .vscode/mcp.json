@@ -1,0 +1,13 @@
+{
+    "servers": {
+        "sta-agent": {
+            "type": "stdio",
+            "command": "python3",
+            "args": ["mcp_server.py"],
+            "cwd": "${workspaceFolder:sta-agent}",
+            "env": {
+                "GNAI_API_KEY": "${env:GNAI_API_KEY}"
+            }
+        }
+    }
+}

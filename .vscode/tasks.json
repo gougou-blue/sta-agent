@@ -1,0 +1,78 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "STA Agent: Ask Question",
+            "type": "shell",
+            "command": "python3",
+            "args": [
+                "agent.py",
+                "${input:staQuestion}"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder:sta-agent}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "STA Agent: Interactive Mode",
+            "type": "shell",
+            "command": "python3",
+            "args": [
+                "agent.py",
+                "--interactive"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder:sta-agent}"
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "STA Agent: Analyze Reports Dir",
+            "type": "shell",
+            "command": "python3",
+            "args": [
+                "agent.py",
+                "--interactive",
+                "--reports-dir",
+                "${input:reportsDir}"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder:sta-agent}"
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "staQuestion",
+            "type": "promptString",
+            "description": "Ask a timing question (e.g., 'worst 10 setup paths in d2d1')"
+        },
+        {
+            "id": "reportsDir",
+            "type": "promptString",
+            "description": "Path to sta_pt reports directory on NFS"
+        }
+    ]
+}
