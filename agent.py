@@ -955,6 +955,10 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
         return {"error": str(e)}
 
 
+# Auto-buckets (PO_INT + PTECO) created by Python during triage — merged into export
+_auto_buckets_for_export = []
+
+
 def handle_tool_call(con, tool_name, tool_input):
     """Execute a tool call and return the result."""
     if tool_name == "query_timing_db":
@@ -1048,9 +1052,12 @@ def handle_tool_call(con, tool_name, tool_input):
         run_label = tool_input["run_label"]
         mode = tool_input["mode"]
         output_path = tool_input["output_path"]
-        buckets = tool_input["buckets"]
-        console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]\n")
-        result = export_bucket_file(buckets, output_path, block, run_label, mode)
+        llm_buckets = tool_input["buckets"]
+        # Merge auto_buckets (PO_INT + PTECO from Python) with LLM's C2C/EXT buckets
+        all_buckets = list(_auto_buckets_for_export) + llm_buckets
+        console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
+        console.print(f"  [dim]{len(_auto_buckets_for_export)} auto-buckets (PO_INT+PTECO) + {len(llm_buckets)} LLM buckets[/dim]\n")
+        result = export_bucket_file(all_buckets, output_path, block, run_label, mode)
         console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
         console.print(f"  [dim]Load in Timing Lite: timinglite.py --bucket {result['path']} <report>[/dim]\n")
         return json.dumps(result, default=str)
@@ -1293,14 +1300,34 @@ def main():
             if summary:
                 console.print(f"  [bold]{summary[0]}[/bold] failing paths, worst slack: [red]{summary[1]}ps[/red]")
             auto = triage_data.get("auto_buckets", {})
+            po_int_buckets = auto.get("po_int", {}).get("buckets", [])
+            pteco_buckets = auto.get("pteco", {}).get("buckets", [])
             po_int_count = auto.get("po_int", {}).get("total_paths", 0)
             pteco_count = auto.get("pteco", {}).get("total_paths", 0)
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
-            console.print(f"  Auto-bucketed: {po_int_count} PO_INT + {pteco_count} PTECO")
+            console.print(f"  Auto-bucketed: {po_int_count} PO_INT ({len(po_int_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining C2C/EXT for LLM: {remaining} paths\n")
 
-            # Serialize triage data for the LLM (truncate to avoid bloat)
-            triage_json = json.dumps(triage_data, default=str)
+            # Store auto_buckets for merging at export time — do NOT send to LLM
+            _auto_buckets_for_export.clear()
+            _auto_buckets_for_export.extend(po_int_buckets)
+            _auto_buckets_for_export.extend(pteco_buckets)
+
+            # Only send remaining_c2c_ext to LLM (not the full triage_data with all auto_buckets)
+            llm_data = {
+                "block": triage_data.get("block"),
+                "mode": triage_data.get("mode"),
+                "summary": triage_data.get("summary"),
+                "auto_bucket_summary": {
+                    "po_int_paths": po_int_count,
+                    "po_int_buckets": len(po_int_buckets),
+                    "pteco_paths": pteco_count,
+                    "pteco_buckets": len(pteco_buckets),
+                    "note": "Auto-buckets are handled by Python. Do NOT include them in your bucket list.",
+                },
+                "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
+            }
+            triage_json = json.dumps(llm_data, default=str)
 
             # Build validate/export params string so LLM doesn't mistype paths
             validate_params = f"mode='{args.mode}'"
@@ -1317,22 +1344,20 @@ def main():
                     f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
-                    f"Follow this workflow:\n"
-                    f"1. Start with ALL auto_buckets (po_int + pteco) — include them as-is.\n"
-                    f"2. For remaining paths touching partition '{partition}', classify using IRIS:\n"
+                    f"IMPORTANT: {po_int_count} PO_INT paths and {pteco_count} PTECO paths are already\n"
+                    f"auto-bucketed by Python. Do NOT include them in your bucket list.\n"
+                    f"Python will automatically merge them into the export.\n\n"
+                    f"Your job: create buckets ONLY for the {remaining} remaining C2C/EXT paths.\n\n"
+                    f"Workflow:\n"
+                    f"1. Use remaining_c2c_ext groups, prefixes, and worst paths to create buckets.\n"
+                    f"2. Classify using IRIS waterfall. As a PO, your actions are:\n"
                     f"   - ECO-003/004: Cell sizing in Fusion Compiler recipe\n"
                     f"   - MOP-001: Long net / high fanout fixes\n"
                     f"   - HRP-001: High logic depth — pipeline insertion or RTL restructuring\n"
-                    f"   - HRP-006/007: Placement review for long distance paths\n"
-                    f"3. For each new bucket:\n"
-                    f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
-                    f"     Do NOT include PathType in filters — it is added automatically.\n"
-                    f"   - Specific root cause and FC recipe action.\n"
-                    f"4. VALIDATE: Call validate_buckets({validate_params}, buckets=<your list>).\n"
-                    f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
-                    f"   MAX 2 validation rounds — then export.\n"
-                    f"5. Call export_bucket_file({export_params}, buckets=<your list>).\n"
-                    f"6. Print summary: each bucket's category, path count, worst slack."
+                    f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
+                    f"   Do NOT include PathType in filters — it is added automatically.\n"
+                    f"4. Call export_bucket_file({export_params}, buckets=<your C2C/EXT buckets only>).\n"
+                    f"5. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
                 triage_question = (
@@ -1340,26 +1365,24 @@ def main():
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
-                    f"Follow this workflow:\n"
-                    f"1. Start with ALL auto_buckets (po_int + pteco) — include them as-is in your final list.\n"
-                    f"2. Focus on remaining_c2c_ext. Use the groups and prefix data to create buckets.\n"
-                    f"   Do NOT call extra query_timing_db — the data is already summarized for you.\n"
-                    f"3. Classify each C2C/EXT bucket using the IRIS waterfall (first match wins):\n"
+                    f"IMPORTANT: {po_int_count} PO_INT paths and {pteco_count} PTECO paths are already\n"
+                    f"auto-bucketed by Python. Do NOT include them in your bucket list.\n"
+                    f"Python will automatically merge them into the export.\n\n"
+                    f"Your job: create buckets ONLY for the {remaining} remaining C2C/EXT paths.\n\n"
+                    f"Workflow:\n"
+                    f"1. Use remaining_c2c_ext groups, prefixes, and worst paths to create buckets.\n"
+                    f"   Do NOT call query_timing_db — the data is already summarized.\n"
+                    f"2. Classify each bucket using the IRIS waterfall (first match wins):\n"
                     f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
                     f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
                     f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (2-30% window, by partition)\n"
                     f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
-                    f"4. For each bucket:\n"
-                    f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
-                    f"     Do NOT include PathType in filters — it is added automatically.\n"
-                    f"   - Map to the closest IRIS rule ID in description.\n"
-                    f"   - Specific root cause and recommended fix action.\n"
-                    f"5. VALIDATE: Call validate_buckets({validate_params}, buckets=<your list>).\n"
-                    f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
-                    f"   MAX 2 validation rounds — then export.\n"
-                    f"6. Call export_bucket_file({export_params}, buckets=<your list>).\n"
-                    f"7. Print triage summary: C2C/EXT findings first (STO action needed),\n"
-                    f"   then PO_OPT, then PO_INT totals per partition, then PTECO."
+                    f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
+                    f"   Do NOT include PathType in filters — it is added automatically.\n"
+                    f"   Map to the closest IRIS rule ID in description.\n"
+                    f"4. Call export_bucket_file({export_params}, buckets=<your C2C/EXT buckets only>).\n"
+                    f"   Python will prepend the {len(po_int_buckets) + len(pteco_buckets)} auto-buckets.\n"
+                    f"5. Print triage summary: C2C/EXT findings first, then PO_OPT totals."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
