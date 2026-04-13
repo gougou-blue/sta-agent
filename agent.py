@@ -1243,64 +1243,83 @@ def main():
                     sys.exit(1)
                 output_path = args.output or f"./buckets/{partition}_{args.mode}.bucket"
 
-            csv_instruction = ""
+            # Pre-call triage_timing_run in Python (avoids LLM path typos & saves a tool round-trip)
+            console.print(f"\n[dim]Running triage analysis...[/dim]")
+            triage_data = triage_timing_run(con, block_label, run_label, args.mode, csv_path=csv_path)
+            if "error" in triage_data:
+                console.print(f"[red]Triage failed: {triage_data['error']}[/red]")
+                sys.exit(1)
+
+            summary = triage_data["summary"]["rows"][0] if triage_data["summary"]["rows"] else []
+            if summary:
+                console.print(f"  [bold]{summary[0]}[/bold] failing paths, worst slack: [red]{summary[1]}ps[/red]")
+            auto = triage_data.get("auto_buckets", {})
+            po_int_count = auto.get("po_int", {}).get("total_paths", 0)
+            pteco_count = auto.get("pteco", {}).get("total_paths", 0)
+            remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
+            console.print(f"  Auto-bucketed: {po_int_count} PO_INT + {pteco_count} PTECO")
+            console.print(f"  Remaining C2C/EXT for LLM: {remaining} paths\n")
+
+            # Serialize triage data for the LLM (truncate to avoid bloat)
+            triage_json = json.dumps(triage_data, default=str)
+
+            # Build validate/export params string so LLM doesn't mistype paths
+            validate_params = f"mode='{args.mode}'"
+            export_params = f"block='{block_label}', run_label='{run_label}', mode='{args.mode}', output_path='{output_path}'"
             if csv_path:
-                csv_instruction = f"\nUse csv_path='{csv_path}' when calling triage_timing_run (ad-hoc mode, no ingest needed).\n"
+                validate_params += f", csv_path='{csv_path}'"
+            else:
+                validate_params += f", block='{block_label}', run_label='{run_label}'"
 
             if persona == 'po':
                 triage_question = (
                     f"Triage all failing {args.mode} paths in partition '{partition}' "
-                    f"(block '{block_label}', run '{run_label}').\n"
-                    f"{csv_instruction}\n"
+                    f"(block '{block_label}', run '{run_label}').\n\n"
                     f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n\n"
+                    f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
+                    f"{triage_json}\n\n"
                     f"Follow this workflow:\n"
-                    f"1. Call triage_timing_run. It returns:\n"
-                    f"   - auto_buckets: PO_INT and PTECO buckets already created by the tool\n"
-                    f"   - remaining_c2c_ext: groups, prefixes, and worst paths that YOU must classify\n"
-                    f"2. Start with ALL auto_buckets (po_int + pteco) — include them as-is.\n"
-                    f"3. For remaining paths touching partition '{partition}', classify using IRIS:\n"
+                    f"1. Start with ALL auto_buckets (po_int + pteco) — include them as-is.\n"
+                    f"2. For remaining paths touching partition '{partition}', classify using IRIS:\n"
                     f"   - ECO-003/004: Cell sizing in Fusion Compiler recipe\n"
                     f"   - MOP-001: Long net / high fanout fixes\n"
                     f"   - HRP-001: High logic depth — pipeline insertion or RTL restructuring\n"
                     f"   - HRP-006/007: Placement review for long distance paths\n"
-                    f"4. For each new bucket:\n"
+                    f"3. For each new bucket:\n"
                     f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
                     f"   - Specific root cause and FC recipe action.\n"
-                    f"5. VALIDATE: Call validate_buckets with ALL buckets (auto + yours).\n"
+                    f"4. VALIDATE: Call validate_buckets({validate_params}, buckets=<your list>).\n"
                     f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
                     f"   MAX 2 validation rounds — then export.\n"
-                    f"6. Call export_bucket_file with ALL buckets to write: {output_path}\n"
-                    f"7. Print summary: each bucket's category, path count, worst slack."
+                    f"5. Call export_bucket_file({export_params}, buckets=<your list>).\n"
+                    f"6. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
                 triage_question = (
-                    f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n"
-                    f"{csv_instruction}\n"
+                    f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n\n"
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
+                    f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
+                    f"{triage_json}\n\n"
                     f"Follow this workflow:\n"
-                    f"1. Call triage_timing_run. It returns:\n"
-                    f"   - auto_buckets.po_int: partition-internal buckets (CLASSIF_PO_INT) — pre-built\n"
-                    f"   - auto_buckets.pteco: PTECO candidates (<2% window) — pre-built\n"
-                    f"   - remaining_c2c_ext: C2C/EXT groups, prefixes, and worst paths for YOU to classify\n"
-                    f"2. Start with ALL auto_buckets (po_int + pteco) — include them as-is in your final list.\n"
-                    f"3. Focus on remaining_c2c_ext. Use the groups and prefix data to create buckets.\n"
+                    f"1. Start with ALL auto_buckets (po_int + pteco) — include them as-is in your final list.\n"
+                    f"2. Focus on remaining_c2c_ext. Use the groups and prefix data to create buckets.\n"
                     f"   Do NOT call extra query_timing_db — the data is already summarized for you.\n"
-                    f"4. Classify each C2C/EXT bucket using the IRIS waterfall (first match wins):\n"
+                    f"3. Classify each C2C/EXT bucket using the IRIS waterfall (first match wins):\n"
                     f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
                     f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
                     f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (2-30% window, by partition)\n"
                     f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
-                    f"5. For each bucket:\n"
+                    f"4. For each bucket:\n"
                     f"   - Filters: MUST include StartPin and/or EndPin regex.\n"
                     f"     Do NOT include PathType in filters — it is added automatically.\n"
                     f"   - Map to the closest IRIS rule ID in description.\n"
                     f"   - Specific root cause and recommended fix action.\n"
-                    f"6. VALIDATE: Call validate_buckets with ALL buckets (auto + yours).\n"
+                    f"5. VALIDATE: Call validate_buckets({validate_params}, buckets=<your list>).\n"
                     f"   If unmatched > 5%, use the unmatched_sample to add more buckets.\n"
                     f"   MAX 2 validation rounds — then export.\n"
-                    f"7. Call export_bucket_file with ALL buckets to write: {output_path}\n"
-                    f"8. Print triage summary: C2C/EXT findings first (STO action needed),\n"
+                    f"6. Call export_bucket_file({export_params}, buckets=<your list>).\n"
+                    f"7. Print triage summary: C2C/EXT findings first (STO action needed),\n"
                     f"   then PO_OPT, then PO_INT totals per partition, then PTECO."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
