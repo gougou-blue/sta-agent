@@ -957,6 +957,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
 
 # Auto-buckets (PO_INT + PTECO) created by Python during triage — merged into export
 _auto_buckets_for_export = []
+_last_exported_bucket_path = None
 
 
 def handle_tool_call(con, tool_name, tool_input):
@@ -1048,6 +1049,7 @@ def handle_tool_call(con, tool_name, tool_input):
         return json.dumps(result, default=str)
 
     elif tool_name == "export_bucket_file":
+        global _last_exported_bucket_path
         block = tool_input["block"]
         run_label = tool_input["run_label"]
         mode = tool_input["mode"]
@@ -1058,6 +1060,7 @@ def handle_tool_call(con, tool_name, tool_input):
         console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
         console.print(f"  [dim]{len(_auto_buckets_for_export)} auto-buckets (PO_INT+PTECO) + {len(llm_buckets)} LLM buckets[/dim]\n")
         result = export_bucket_file(all_buckets, output_path, block, run_label, mode)
+        _last_exported_bucket_path = result.get("path")
         console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
         console.print(f"  [dim]Load in Timing Lite: timinglite.py --bucket {result['path']} <report>[/dim]\n")
         return json.dumps(result, default=str)
@@ -1387,7 +1390,11 @@ def main():
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
             # Post-triage check: did the bucket file get created?
-            if os.path.isfile(output_path):
+            actual_path = _last_exported_bucket_path or output_path
+            if os.path.isfile(actual_path):
+                console.print(f"\n[bold green]\u2713 Bucket file written:[/bold green] {os.path.abspath(actual_path)}")
+                console.print(f"[dim]  Load in Timing Lite: timinglite.py --bucket {os.path.abspath(actual_path)} <report>[/dim]")
+            elif actual_path != output_path and os.path.isfile(output_path):
                 console.print(f"\n[bold green]\u2713 Bucket file written:[/bold green] {os.path.abspath(output_path)}")
                 console.print(f"[dim]  Load in Timing Lite: timinglite.py --bucket {os.path.abspath(output_path)} <report>[/dim]")
             else:
