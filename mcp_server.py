@@ -163,19 +163,30 @@ def read_report(
 
 
 @mcp.tool()
-def triage_timing_run(block: str, run_label: str, mode: str) -> str:
+def triage_timing_run(block: str = "", run_label: str = "", mode: str = "setup", csv_path: str = "") -> str:
     """Analyze all failing paths (up to 200K) in a block/run and group into triage bucket candidates.
 
     Groups paths by clock domains, partition crossings, path types, and logic depth.
     Returns a summary, all grouped bucket candidates (no limit), and the top 200 worst paths.
     Use this as the first step when triaging a timing run.
 
+    Works in two modes:
+    - Pre-ingested data: provide block + run_label + mode
+    - Ad-hoc CSV: provide csv_path (NFS path to a .csv.gz report) + mode
+
     Args:
-        block: Block name (e.g. d2d1).
-        run_label: Run label (e.g. 26ww14.3).
+        block: Block name (e.g. d2d1) — for pre-ingested data.
+        run_label: Run label (e.g. 26ww14.3) — for pre-ingested data.
         mode: 'setup' or 'hold'.
+        csv_path: Path to a CSV.gz timing report on NFS — for ad-hoc triage without ingesting.
     """
-    result = _triage_timing_run(_get_con(), block, run_label, mode)
+    result = _triage_timing_run(
+        _get_con(),
+        block or None,
+        run_label or None,
+        mode,
+        csv_path=csv_path or None,
+    )
     return json.dumps(result, default=str)
 
 

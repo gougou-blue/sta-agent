@@ -164,25 +164,29 @@ TOOL_SCHEMA = [
     },
     {
         "name": "triage_timing_run",
-        "description": "Analyze all failing paths (up to 200K) in a block/run and group them into bucket candidates based on clock domains, partition crossings, path types, and logic depth. Returns: a summary, all grouped bucket candidates (no limit), and the top 200 worst individual paths for pattern analysis. Use this as the first step of triage.",
+        "description": "Analyze all failing paths (up to 200K) in a block/run and group them into bucket candidates based on clock domains, partition crossings, path types, and logic depth. Returns: a summary, all grouped bucket candidates (no limit), and the top 200 worst individual paths for pattern analysis. Use this as the first step of triage. Works with either pre-ingested data (block/run_label/mode) or ad-hoc CSV files (csv_path).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "block": {
                     "type": "string",
-                    "description": "Block name (e.g., d2d1)"
+                    "description": "Block name (e.g., d2d1) — for pre-ingested data"
                 },
                 "run_label": {
                     "type": "string",
-                    "description": "Run label (e.g., 26ww14.3)"
+                    "description": "Run label (e.g., 26ww14.3) — for pre-ingested data"
                 },
                 "mode": {
                     "type": "string",
                     "enum": ["setup", "hold"],
                     "description": "setup or hold"
+                },
+                "csv_path": {
+                    "type": "string",
+                    "description": "Path to a CSV.gz timing report on NFS — for ad-hoc triage without ingesting. If provided, block/run_label are optional labels."
                 }
             },
-            "required": ["block", "run_label", "mode"]
+            "required": ["mode"]
         }
     },
     {
@@ -447,25 +451,41 @@ def read_report_file(block=None, run_label=None, mode=None, report_name=None,
         }
 
 
-def triage_timing_run(con, block, run_label, mode):
-    """Analyze failing paths and group into triage bucket candidates."""
+def triage_timing_run(con, block, run_label, mode, csv_path=None):
+    """Analyze failing paths and group into triage bucket candidates.
+
+    Works in two modes:
+    - Ingested data: queries the paths table (block/run_label/mode)
+    - Ad-hoc CSV: queries a CSV.gz file directly via read_csv_auto (csv_path)
+    """
     try:
+        if csv_path:
+            # Ad-hoc mode: query CSV directly
+            source = f"read_csv_auto('{csv_path}')"
+            where = "slack < 0"
+            params = []
+        else:
+            # Ingested mode: query paths table
+            source = "paths"
+            where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
+            params = [block, run_label, mode]
+
         # Overall summary
-        summary = con.execute("""
+        summary = con.execute(f"""
             SELECT
                 COUNT(*) as total_failing,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(AVG(slack), 1) as avg_slack,
                 COUNT(DISTINCT launch_clock || ' -> ' || capture_clock) as clock_domain_pairs,
                 COUNT(DISTINCT driver_partition || ' -> ' || receiver_partition) as partition_crossings
-            FROM paths
-            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
-        """, [block, run_label, mode])
+            FROM {source}
+            WHERE {where}
+        """, params)
         sum_cols = [d[0] for d in summary.description]
         sum_rows = [list(r) for r in summary.fetchall()]
 
         # Bucket candidates: group by key dimensions
-        groups = con.execute("""
+        groups = con.execute(f"""
             SELECT
                 launch_clock,
                 capture_clock,
@@ -480,32 +500,32 @@ def triage_timing_run(con, block, run_label, mode):
                 ROUND(AVG(levels_of_logic), 0) as avg_levels_of_logic,
                 MIN(levels_of_logic) as min_lol,
                 MAX(levels_of_logic) as max_lol
-            FROM paths
-            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
+            FROM {source}
+            WHERE {where}
             GROUP BY launch_clock, capture_clock, int_ext, int_ext_child,
                      driver_partition, receiver_partition
             ORDER BY path_count DESC
-        """, [block, run_label, mode])
+        """, params)
         grp_cols = [d[0] for d in groups.description]
         grp_rows = [list(r) for r in groups.fetchall()]
 
         # Top 200 worst paths with full detail for pattern analysis
-        worst = con.execute("""
+        worst = con.execute(f"""
             SELECT
                 slack, clock_percentage, launch_clock, capture_clock,
                 int_ext, int_ext_child, driver_partition, receiver_partition,
                 levels_of_logic, startpoint, endpoint
-            FROM paths
-            WHERE block = ? AND run_label = ? AND mode = ? AND slack < 0
+            FROM {source}
+            WHERE {where}
             ORDER BY slack ASC
             LIMIT 200
-        """, [block, run_label, mode])
+        """, params)
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
 
         return {
-            "block": block,
-            "run_label": run_label,
+            "block": block or os.path.basename(csv_path),
+            "run_label": run_label or csv_path,
             "mode": mode,
             "summary": {"columns": sum_cols, "rows": sum_rows},
             "bucket_candidates": {"columns": grp_cols, "rows": grp_rows, "count": len(grp_rows)},
@@ -629,11 +649,13 @@ def handle_tool_call(con, tool_name, tool_input):
         return json.dumps(result, default=str)
 
     elif tool_name == "triage_timing_run":
-        block = tool_input["block"]
-        run_label = tool_input["run_label"]
+        block = tool_input.get("block")
+        run_label = tool_input.get("run_label")
         mode = tool_input["mode"]
-        console.print(f"\n[dim]Triaging {block}/{run_label} ({mode})...[/dim]\n")
-        result = triage_timing_run(con, block, run_label, mode)
+        csv_path = tool_input.get("csv_path")
+        label = csv_path or f"{block}/{run_label}"
+        console.print(f"\n[dim]Triaging {label} ({mode})...[/dim]\n")
+        result = triage_timing_run(con, block, run_label, mode, csv_path=csv_path)
         if "error" not in result:
             summary = result["summary"]["rows"][0] if result["summary"]["rows"] else []
             if summary:
@@ -823,12 +845,41 @@ def main():
 
     try:
         if args.triage:
-            if not all([args.block, args.run, args.mode]):
-                console.print("[red]--triage requires --block, --run, and --mode[/red]")
+            if not args.mode:
+                console.print("[red]--triage requires --mode (setup or hold)[/red]")
                 sys.exit(1)
-            output_path = args.output or f"./buckets/{args.block}_{args.run}_{args.mode}.bucket"
+            # Determine CSV path for ad-hoc triage
+            csv_path = None
+            if args.reports_dir:
+                # Find the matching CSV in the reports dir
+                suffix = f"report_summary.{'max' if args.mode == 'setup' else 'min'}.csv.gz"
+                if os.path.isdir(args.reports_dir):
+                    for f in os.listdir(args.reports_dir):
+                        if f.endswith(suffix):
+                            csv_path = os.path.join(args.reports_dir, f)
+                            break
+                if not csv_path:
+                    # Try using reports_dir as a direct file path
+                    if os.path.isfile(args.reports_dir):
+                        csv_path = args.reports_dir
+                    else:
+                        console.print(f"[red]No *{suffix} found in {args.reports_dir}[/red]")
+                        sys.exit(1)
+            elif not args.block or not args.run:
+                console.print("[red]--triage requires either (--block + --run) or --reports-dir[/red]")
+                sys.exit(1)
+
+            block_label = args.block or os.path.basename(csv_path or 'unknown')
+            run_label = args.run or csv_path or 'ad-hoc'
+            output_path = args.output or f"./buckets/{block_label}_{args.mode}.bucket"
+
+            csv_instruction = ""
+            if csv_path:
+                csv_instruction = f"\nUse csv_path='{csv_path}' when calling triage_timing_run (ad-hoc mode, no ingest needed).\n"
+
             triage_question = (
-                f"Triage all failing {args.mode} paths in block '{args.block}', run '{args.run}'.\n\n"
+                f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n"
+                f"{csv_instruction}\n"
                 f"Follow this workflow:\n"
                 f"1. Call triage_timing_run to get bucket candidates and worst paths.\n"
                 f"2. Analyze the groups — identify root cause patterns, merge small groups that share \n"

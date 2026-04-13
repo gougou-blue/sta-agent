@@ -62,14 +62,17 @@ python3 agent.py -i   # interactive with pre-ingested data
 Auto-bucket failing paths and generate a timinglite-compatible bucket file:
 
 ```bash
-# Triage setup violations for d2d1
+# Triage pre-ingested data
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
+
+# Triage any CSV on NFS — no ingest needed
+python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
+
+# Triage a specific CSV file directly
+python3 agent.py --triage --reports-dir /path/to/report_summary.max.csv.gz -m setup
 
 # Specify output path for the bucket file
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
-
-# Triage hold violations
-python3 agent.py --triage -b d2d4 -r 26ww15.2 -m hold
 ```
 
 The agent will:
