@@ -514,8 +514,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
     """
     try:
         if csv_path:
-            # Ad-hoc mode: query CSV directly
-            source = f"read_csv_auto('{csv_path}')"
+            # Ad-hoc mode: normalize CSV column names to our standard schema
+            source = _csv_source_with_aliases(con, csv_path)
             where = "slack < 0"
             params = []
         else:
@@ -779,6 +779,41 @@ FILTER_COL_MAP = {
 }
 
 
+def _csv_source_with_aliases(con, csv_path):
+    """Build a SQL source expression that aliases CSV columns to standard names.
+
+    Raw CSVs can have different column names (e.g. start_clock vs launch_clock).
+    Returns a subquery that normalizes to our standard schema.
+    """
+    raw_src = f"read_csv_auto('{csv_path}')"
+    col_check = con.execute(f"SELECT * FROM {raw_src} LIMIT 0")
+    csv_cols = {d[0].lower() for d in col_check.description}
+
+    def col_or_null(standard, *alternatives):
+        for alt in (standard,) + alternatives:
+            if alt in csv_cols:
+                return f'"{alt}" AS {standard}'
+        return f"NULL AS {standard}"
+
+    aliases = [
+        col_or_null("slack", "normal_slack"),
+        col_or_null("clock_percentage"),
+        col_or_null("period"),
+        col_or_null("startpoint"),
+        col_or_null("endpoint"),
+        col_or_null("launch_clock", "start_clock"),
+        col_or_null("capture_clock", "end_clock"),
+        col_or_null("path_group"),
+        col_or_null("int_ext"),
+        col_or_null("int_ext_child"),
+        col_or_null("driver_partition"),
+        col_or_null("receiver_partition"),
+        col_or_null("levels_of_logic"),
+        col_or_null("path_type"),
+    ]
+    return f"(SELECT {', '.join(aliases)} FROM {raw_src}) AS csv_data"
+
+
 def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
     """Test bucket filter coverage against actual failing paths.
 
@@ -788,7 +823,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
     """
     try:
         if csv_path:
-            source = f"read_csv_auto('{csv_path}')"
+            source = _csv_source_with_aliases(con, csv_path)
             base_where = "slack < 0"
             params = []
         else:
