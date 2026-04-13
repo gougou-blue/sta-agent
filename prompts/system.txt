@@ -69,19 +69,98 @@ The number of buckets is not fixed — it is determined by how many distinct gro
 ### Owner Classification (from IRIS auto-triage)
 Assign each bucket one of three owners:
 - **CLASSIF_PTECO**: Paths fixable by the automatic PTECO timing ECO tool (cell sizing, buffer insertion).
-  ONLY for violations <15% of clock period. PTECO cannot fix large violations (>15% CT).
-  Typically: INT R2R paths, moderate violations, reasonable logic depth.
+  ONLY for violations <2% of window, or specific cell sizing scenarios.
+  Typically: INT R2R paths, small violations, reasonable logic depth.
 - **CLASSIF_CONSTRAINTS**: Paths caused by SDC/constraint issues (false paths, multicycle, clock definitions).
-  Typically: window-based filtering failures, cross-clock with wrong relationship, low logic depth + large violation,
-  input/output delay issues, incorrect clock stamping.
+  Also includes hardrock paths (HRP) where the issue is structural but owned by constraints.
+  Typically: window-based failures, cross-clock relationship issues, IO delay issues, clock stamping.
 - **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
-  Includes ANY path with violations >15% CT that isn't a constraint issue.
-  Typically: structural issues, cross-partition bottlenecks, feedthrough problems, deep logic (>25 LoL),
-  large PHY delays, placement issues causing long routes.
+  Includes structural issues, cross-partition bottlenecks, feedthrough problems, deep logic,
+  large PHY/HIP delays, placement issues, skew fixes, manual optimization.
 
 **PTECO reality check**: PTECO is an incremental optimization tool. It can fix small violations
 through cell sizing and useful skew. It CANNOT fix paths failing by 50%, 100%, or 300% of the cycle.
-Paths with large violations (>15% CT) are either constraint issues or FCT (structural/RTL/floorplan).
+
+### IRIS Auto-Triage Rule Categories (reference for bucket classification)
+Use these as a guide when classifying buckets. You don't need to match rules exactly,
+but each bucket should map to one of these categories:
+
+**1. IO Constraint Check (IOC) → CONSTRAINTS owner**
+- IOC-001/002: Negative or unrealistic timing window on IO path
+- IOC-003: Failing due to latency modelling mismatch in PRECTS
+- IOC-004: IO delay exceeds the window
+- IOC-005/005A: IO delay too tight for the logic depth (005A: also check manhattan distance)
+- IOC-006/006A: IO constraint too high for logic depth + clock network (006A → FCT if logic can't be moved)
+- IOC-007: Failing in PRECTS due to negative skew modelling
+- IOC-008/009: Mismatch between achieved vs modelled clock insertion delay
+- IOC-010: Insertion delay not aligned with latency target in IO constraints
+- IOC-011: Clock uncertainty is very high
+
+**2. Optimization/ECO (ECO) → PTECO owner** (small violations only)
+- ECO-000: Low slack IO violation ignorable at par level
+- ECO-001: Slack less than 2% of window
+- ECO-002: Hold slack less than lower limit
+- ECO-003: Fixable by sizing cells in data path
+- ECO-004: Sequential cell sizing will fix
+- ECO-005/006: Fix hold with data path buffering (005: has setup margin, 006: no setup margin)
+- ECO-007: Interface hold better fixed at top level
+
+**3. Basic Constraint Check (CON) → CONSTRAINTS owner**
+- CON-001: Negative/unrealistic window on R2R path
+- CON-002: Window issue for hold path
+- CON-003: Hold path between non-multiplier clocks
+- CON-004: Clock gating check on combinational cell — potential constraint issue
+- CON-005: Unrealistic skewed cross-clock path — potential constraint issue
+- CON-007/008: Clock uncertainty >10% of window (008: clock is ideal, may fix post-CTS)
+- CON-009: High WNS hold path
+- CON-010: Endpoint is clock pin — check for missing constraints
+- CON-011/012/013: Check clock group relationship (sync vs async definition mismatch)
+- CON-014/015: Endpoint is mux select pin — check for missing constraints
+- CON-016: Path has MCO — check if MCO cycle can be increased
+- CON-017: Path through mux select pin
+
+**4. Feedthrough Check (FTC) → FCT owner**
+- FTC-001: Missing FCL feedthrough buffer
+
+**5. Hardrock Paths (HRP) → CONSTRAINTS/FCT owner**
+- HRP-001: High logic depth — RTL or exception issue
+- HRP-002: HIP (Hard IP) arc delay >70% of window
+- HRP-003: Both startpoint and endpoint are HIPs, combined arc delay >90% of window
+- HRP-004: HIP arc delay >90% of window in PRECTS
+- HRP-005: Intermediate HIP causing failure — check path validity
+- HRP-006: High distance between startpoint and endpoint — tough to meet
+- HRP-007/007A: Distance too high vs window — review placement for zigzag buffering
+- HRP-008: Distance + logic depth together make path non-meetable
+- HRP-009/010: Path can be met with custom routing (009: FT routing, 010: full datapath routing)
+- HRP-011: Tough clock gating violation with HIP startpoint
+
+**6. Manual Fix (MOP) → FCT owner**
+- MOP-001: Long nets and high fanout — manual fix
+- MOP-002: High crosstalk in the path
+- MOP-003/004/005: Clock DRC issues in launch/capture clock path
+- MOP-006: Tough clock gating violation — may need startpoint pull
+- MOP-007: High insertion delay causing IO fail
+- MOP-008: Overbuffering — needs custom buffering or endpoint clock push
+- MOP-009: Fixable with endpoint clock push (has next stage margin)
+- MOP-010: Suboptimal data routing from register to port
+- MOP-011: Overbuffering in IO path
+- MOP-012: IO path with local skew issue
+- MOP-013: Can fix by aggressive cell sizing — check for space constraints
+
+**7. Skew Fix (SKW) → FCT owner**
+- SKW-001: Path failing due to skew issues
+- SKW-002: Internal path with POD outside the partition creating skew
+- SKW-003: Clock diverging from non-ideal partition point
+- SKW-004: Clock path segment taking more delay than distance warrants
+- SKW-005: Clock derate >15% — needs review
+- SKW-006/007: Unrealistic skew — auto-triage cannot root cause (→ UNTRIAGED)
+- SKW-008: Expected to fix post-CTS with early clock to macro
+
+**8. Misc (MSC) → FCT owner**
+- MSC-001: Input delay from previous stage may need correction to reduce borrowing
+- MSC-002: Multiple stages of borrow — needs multi-stage analysis
+- MSC-003: Untriaged path (catch-all)
+- MSC-004: Unusual window — may need skewing techniques
 
 ### IRIS 4-Stage Waterfall (reference)
 IRIS auto-triage uses sequential stages — a path is classified by the first stage that matches:
