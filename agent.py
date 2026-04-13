@@ -682,7 +682,7 @@ def handle_tool_call(con, tool_name, tool_input):
 
 
 def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL,
-              reports_dir=None, messages=None):
+              reports_dir=None, messages=None, max_tokens=4096):
     """Run the agent loop: question → tool calls → analysis.
     
     If messages is provided, appends to existing conversation (for follow-ups).
@@ -714,7 +714,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
     for _ in range(10):  # safety limit
         response = client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=max_tokens,
             system=system_prompt,
             tools=TOOL_SCHEMA,
             messages=messages,
@@ -895,7 +895,15 @@ def main():
                 f"5. Print a triage summary: each bucket's owner, path count, worst slack, and action."
             )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
-                      model=model, reports_dir=args.reports_dir)
+                      model=model, reports_dir=args.reports_dir, max_tokens=16384)
+            # Post-triage check: did the bucket file get created?
+            if os.path.isfile(output_path):
+                console.print(f"\n[bold green]\u2713 Bucket file written:[/bold green] {os.path.abspath(output_path)}")
+                console.print(f"[dim]  Load in Timing Lite: timinglite.py --bucket {os.path.abspath(output_path)} <report>[/dim]")
+            else:
+                console.print(f"\n[bold yellow]\u26a0 Bucket file was NOT created at: {output_path}[/bold yellow]")
+                console.print("[yellow]  The agent may have run out of tokens before reaching the export step.")
+                console.print("  Try re-running, or use interactive mode to complete the export.[/yellow]")
         elif args.interactive:
             interactive_mode(con, client, model, reports_dir=args.reports_dir)
         elif args.question:
