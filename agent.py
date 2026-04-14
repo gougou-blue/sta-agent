@@ -677,11 +677,55 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "path_count": count,
             })
 
-        # ── Remaining paths for LLM: INT_C2C + EXT (exclude Partition_Internals + PTECO) ──
-        # Exclude: auto-bucketed INT (Partition_Internals) + PTECO candidates
+        # ── Auto-bucket 3: EXT paths → group by n-1 partition crossing + clock domain ──
+        ext_paths = con.execute(f"""
+            SELECT
+                split_part(startpoint, '/', 1) as sp_n1,
+                split_part(endpoint, '/', 1) as ep_n1,
+                launch_clock, capture_clock,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
+            FROM {source}
+            WHERE {where}
+              AND int_ext = 'EXT'
+              AND NOT (clock_percentage >= 0 AND clock_percentage < 2)
+            GROUP BY sp_n1, ep_n1, launch_clock, capture_clock
+            ORDER BY path_count DESC
+        """, params)
+        ext_buckets = []
+        ext_total = 0
+        for row in ext_paths.fetchall():
+            sp_n1, ep_n1, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            if not sp_n1:
+                continue
+            ext_total += count
+            # Determine crossing description
+            if sp_n1 == ep_n1:
+                crossing = sp_n1
+            else:
+                crossing = f"{sp_n1}->{ep_n1}"
+            filters = [f"StartPin:^{sp_n1}/.*", f"EndPin:^{ep_n1}/.*"]
+            if lclk:
+                filters.append(f"LaunchClk:{lclk}")
+            if cclk:
+                filters.append(f"CaptureClk:{cclk}")
+            ext_buckets.append({
+                "priority": 80,
+                "filters": filters,
+                "classification": "EXT_C2C",
+                "description": f"EXT {crossing}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
+                "auto": True,
+                "path_count": count,
+            })
+
+        # ── Remaining: only INT_C2C for LLM (if leaf_depth > 1) ──
         remaining_where = (f"{where}"
             f" AND NOT ({int_exclude_cond})"
-            f" AND NOT (int_ext != 'INT' AND clock_percentage >= 0 AND clock_percentage < 2)")
+            f" AND NOT (int_ext != 'INT' AND clock_percentage >= 0 AND clock_percentage < 2)"
+            f" AND int_ext != 'EXT'")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
@@ -758,7 +802,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "po_int": {"buckets": po_int_buckets, "total_paths": po_int_total},
                 "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
                 "int_c2c": {"buckets": int_c2c_buckets, "total_paths": int_c2c_total},
-                "note": "po_int and pteco are pre-classified. int_c2c are reference groups for the LLM.",
+                "ext": {"buckets": ext_buckets, "total_paths": ext_total},
+                "note": "All categories are auto-bucketed by Python. INT_C2C goes to LLM only for classification refinement.",
             },
             "remaining_c2c_ext": {
                 "total_paths": remaining_count,
@@ -767,7 +812,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "startpoint_prefixes": sp_rows,
                 "endpoint_prefixes": ep_rows,
                 "worst_paths": {"columns": worst_cols, "rows": worst_rows},
-                "note": "YOU must classify these into buckets. Use the groups, prefixes, and worst paths to create filter patterns.",
+                "note": "These are INT_C2C paths. Classify using IRIS waterfall.",
             },
         }
     except Exception as e:
@@ -1134,21 +1179,22 @@ def handle_tool_call(con, tool_name, tool_input):
         mode = tool_input["mode"]
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
-        # Strip any PO_INT or PTECO buckets the LLM created — Python handles those
+        # Strip any auto-bucketed classifications the LLM created — Python handles those
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C"}
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:
             classif = b.get("classification", "")
-            if classif in ("CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO"):
+            if classif in auto_classifs:
                 stripped += 1
             else:
                 filtered_llm.append(b)
         if stripped:
-            console.print(f"  [dim]Stripped {stripped} LLM-generated PO_INT/PTECO buckets (Python handles those)[/dim]")
-        # Merge: LLM C2C/EXT buckets first (higher priority), then auto-buckets at the end
+            console.print(f"  [dim]Stripped {stripped} LLM-generated auto-bucketed classifications (Python handles those)[/dim]")
+        # Merge: LLM INT_C2C buckets first (higher priority), then auto-buckets at the end
         all_buckets = filtered_llm + list(_auto_buckets_for_export)
         console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
-        console.print(f"  [dim]{len(filtered_llm)} LLM buckets + {len(_auto_buckets_for_export)} auto-buckets (PO_INT+PTECO)[/dim]\n")
+        console.print(f"  [dim]{len(filtered_llm)} LLM buckets + {len(_auto_buckets_for_export)} auto-buckets[/dim]\n")
         result = export_bucket_file(all_buckets, output_path, block, run_label, mode)
         _last_exported_bucket_path = result.get("path")
         console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
@@ -1397,21 +1443,24 @@ def main():
             po_int_buckets = auto.get("po_int", {}).get("buckets", [])
             pteco_buckets = auto.get("pteco", {}).get("buckets", [])
             int_c2c_buckets = auto.get("int_c2c", {}).get("buckets", [])
+            ext_buckets = auto.get("ext", {}).get("buckets", [])
             po_int_count = auto.get("po_int", {}).get("total_paths", 0)
             pteco_count = auto.get("pteco", {}).get("total_paths", 0)
             int_c2c_count = auto.get("int_c2c", {}).get("total_paths", 0)
+            ext_count = auto.get("ext", {}).get("total_paths", 0)
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
-            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
-            console.print(f"  INT_C2C (cross-partition): {int_c2c_count} paths ({len(int_c2c_buckets)} groups)")
-            console.print(f"  Remaining for LLM (INT_C2C + EXT): {remaining} paths\n")
+            auto_total = po_int_count + pteco_count + ext_count
+            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
+            console.print(f"  INT_C2C for LLM: {int_c2c_count} paths ({len(int_c2c_buckets)} groups)")
+            console.print(f"  Remaining for LLM: {remaining} paths\n")
 
-            # Store auto_buckets for merging at export time — do NOT send to LLM
-            # Only Partition_Internals and PTECO are auto-bucketed; INT_C2C goes to LLM
+            # Store ALL auto_buckets for merging at export time
             _auto_buckets_for_export.clear()
             _auto_buckets_for_export.extend(po_int_buckets)
             _auto_buckets_for_export.extend(pteco_buckets)
+            _auto_buckets_for_export.extend(ext_buckets)
 
-            # Only send remaining_c2c_ext to LLM (not the full triage_data with all auto_buckets)
+            # Only send INT_C2C reference + remaining to LLM
             llm_data = {
                 "block": triage_data.get("block"),
                 "mode": triage_data.get("mode"),
@@ -1419,11 +1468,13 @@ def main():
                 "auto_bucket_summary": {
                     "partition_internals_paths": po_int_count,
                     "partition_internals_buckets": len(po_int_buckets),
+                    "ext_paths": ext_count,
+                    "ext_buckets": len(ext_buckets),
                     "pteco_paths": pteco_count,
                     "pteco_buckets": len(pteco_buckets),
                     "int_c2c_paths": int_c2c_count,
                     "int_c2c_groups": len(int_c2c_buckets),
-                    "note": "Partition_Internals and PTECO are handled by Python. INT_C2C paths are in the remaining data — classify them as INT_C2C or appropriate IRIS category.",
+                    "note": "Partition_Internals, EXT, and PTECO are fully handled by Python. You only handle INT_C2C.",
                 },
                 "int_c2c_reference": [
                     {"description": b["description"], "path_count": b["path_count"]}
@@ -1464,34 +1515,28 @@ def main():
                     f"5. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
+                auto_count = len(po_int_buckets) + len(pteco_buckets) + len(ext_buckets)
                 triage_question = (
                     f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n\n"
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
-                    f"IMPORTANT: {po_int_count} Partition_Internals paths and {pteco_count} PTECO paths are already\n"
-                    f"auto-bucketed by Python. Do NOT include them in your bucket list.\n"
-                    f"Python will automatically merge them into the export.\n\n"
-                    f"Your job: create buckets for the {remaining} remaining paths (INT_C2C + EXT).\n"
-                    f"  - {int_c2c_count} INT_C2C paths (cross-partition internal, STO's responsibility)\n"
-                    f"  - The rest are EXT paths.\n\n"
+                    f"IMPORTANT: Python has already auto-bucketed:\n"
+                    f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
+                    f"  - {ext_count} EXT paths ({len(ext_buckets)} buckets)\n"
+                    f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
+                    f"Do NOT include these in your bucket list. Python will merge them.\n\n"
+                    f"Your job: create buckets ONLY for the {int_c2c_count} INT_C2C paths.\n"
+                    f"These are internal paths crossing partition boundaries (STO's responsibility).\n\n"
                     f"Workflow:\n"
-                    f"1. Use remaining_c2c_ext groups, prefixes, and worst paths to create buckets.\n"
-                    f"   Also use int_c2c_reference for cross-partition INT groupings.\n"
+                    f"1. Use int_c2c_reference and remaining_c2c_ext data to create INT_C2C buckets.\n"
                     f"   Do NOT call query_timing_db — the data is already summarized.\n"
-                    f"2. Classify each bucket using the IRIS waterfall (first match wins):\n"
-                    f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
-                    f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
-                    f"   Stage 3 - INT_C2C (cross-partition) → INT_C2C (int_ext='INT', different leaf partitions)\n"
-                    f"     These are internal paths crossing partition boundaries. Group by partition pair + clock domain.\n"
-                    f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
-                    f"3. CRITICAL: NEVER mix INT and EXT paths in the same bucket.\n"
-                    f"   Check the int_ext column in the data. If a group has both, split it.\n"
+                    f"2. Group by partition pair + clock domain.\n"
+                    f"3. Classify using IRIS waterfall: HRP (high logic depth), ECO (small slack), etc.\n"
                     f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"   Map to the closest IRIS rule ID in description.\n"
-                    f"5. Call export_bucket_file({export_params}, buckets=<your buckets>).\n"
-                    f"   Python will prepend the {len(po_int_buckets) + len(pteco_buckets)} auto-buckets.\n"
+                    f"5. Call export_bucket_file({export_params}, buckets=<your INT_C2C buckets only>).\n"
+                    f"   Python will prepend the {auto_count} auto-buckets.\n"
                     f"6. Print triage summary: bucket #, classification, path count, worst slack."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
