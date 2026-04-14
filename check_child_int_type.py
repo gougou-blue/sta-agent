@@ -53,3 +53,27 @@ query(f"""
     GROUP BY thru_children, child_int_type
     ORDER BY cnt DESC
 """)
+
+print("=== EXT paths: n-1 partition crossing + clock domain (top 20) ===")
+query(f"""
+    SELECT
+        split_part(start_pin, '/', 1) as sp_n1,
+        split_part(end_pin, '/', 1) as ep_n1,
+        start_clock, end_clock,
+        COUNT(*) as cnt,
+        ROUND(MIN(normal_slack), 1) as worst_slack
+    FROM read_csv_auto('{csv}')
+    WHERE normal_slack < 0 AND int_ext = 'EXT'
+    GROUP BY sp_n1, ep_n1, start_clock, end_clock
+    ORDER BY cnt DESC
+    LIMIT 20
+""")
+
+print("=== EXT sample startpoints (first 10) ===")
+query(f"""
+    SELECT start_pin, end_pin, int_ext, normal_slack
+    FROM read_csv_auto('{csv}')
+    WHERE normal_slack < 0 AND int_ext = 'EXT'
+    ORDER BY normal_slack ASC
+    LIMIT 10
+""")
