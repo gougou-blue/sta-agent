@@ -543,6 +543,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         # Use int_ext='INT' AND int_ext_child='INT' as the reliable indicator.
         # Derive partition name from the common startpoint prefix (first path component before /).
         # Never rely solely on driver_partition/receiver_partition — they may be NULL in raw CSVs.
+        # Sub-group PO_INT by (partition, clock pair, startpoint prefix, endpoint prefix) for useful triage.
         po_int = con.execute(f"""
             SELECT
                 COALESCE(
@@ -552,30 +553,68 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
                          ELSE 'unknown'
                     END
                 ) as partition,
+                launch_clock, capture_clock,
+                CASE WHEN POSITION('/' IN startpoint) > 0
+                     THEN SUBSTRING(startpoint, 1, POSITION('/' IN startpoint) - 1)
+                     ELSE startpoint
+                END as sp_prefix,
+                CASE WHEN POSITION('/' IN endpoint) > 0
+                     THEN SUBSTRING(endpoint, 1, POSITION('/' IN endpoint) - 1)
+                     ELSE endpoint
+                END as ep_prefix,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
-                ROUND(MIN(clock_percentage), 1) as worst_clock_pct
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                ROUND(AVG(clock_percentage), 1) as avg_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
             FROM {source}
             WHERE {where}
               AND int_ext = 'INT'
               AND (int_ext_child = 'INT' OR int_ext_child IS NULL)
-            GROUP BY partition
+            GROUP BY partition, launch_clock, capture_clock, sp_prefix, ep_prefix
             ORDER BY path_count DESC
         """, params)
         po_int_buckets = []
         po_int_total = 0
+        po_int_idx = 0
         for row in po_int.fetchall():
-            part_name, count, worst_s, worst_pct = row
+            part_name, lclk, cclk, sp, ep, count, worst_s, avg_s, worst_pct, avg_pct, avg_lol = row
             if not part_name or part_name == 'unknown':
                 continue
             po_int_total += count
+            po_int_idx += 1
+            filters = []
+            if lclk:
+                filters.append(f"LaunchClk:{lclk}")
+            if cclk:
+                filters.append(f"CaptureClk:{cclk}")
+            if sp:
+                filters.append(f"StartPin:^{sp}.*")
+            if ep:
+                filters.append(f"EndPin:^{ep}.*")
+
+            # Pre-classify based on stats
+            if worst_pct and worst_pct > 100:
+                classif = "CLASSIF_CONSTRAINTS"
+            elif avg_pct and avg_pct <= 30:
+                classif = "CLASSIF_PO_OPT"
+            else:
+                classif = "CLASSIF_PO_INT"
+
+            desc = (f"PO_INT {part_name}: {lclk}->{cclk} {sp}->{ep} "
+                    f"({count} paths, worst {worst_s}ps/{worst_pct}%w, avg {avg_s}ps/{avg_pct}%w, "
+                    f"avg_lol={avg_lol})")
             po_int_buckets.append({
-                "priority": 90,
-                "filters": [f"StartPin:^{part_name}.*", f"EndPin:^{part_name}.*"],
-                "classification": "CLASSIF_PO_INT",
-                "description": f"Partition-internal paths in {part_name} ({count} paths, worst {worst_s}ps) — PO action required",
+                "priority": po_int_idx,
+                "filters": filters,
+                "classification": classif,
+                "description": desc,
                 "auto": True,
                 "path_count": count,
+                "worst_slack": worst_s,
+                "avg_clock_pct": avg_pct,
+                "worst_clock_pct": worst_pct,
             })
 
         # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2, NOT internal) ──
@@ -595,9 +634,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         """, params)
         pteco_buckets = []
         pteco_total = 0
+        pteco_idx = po_int_idx  # Continue priority numbering after PO_INT
         for row in pteco.fetchall():
             lclk, cclk, dpart, rpart, count, worst_s, worst_pct = row
             pteco_total += count
+            pteco_idx += 1
             desc = f"PTECO: {lclk}->{cclk} {dpart}->{rpart} ({count} paths, worst {worst_s}ps, {worst_pct}% window)"
             filters = [f"LaunchClk:{lclk}", f"CaptureClk:{cclk}"]
             if dpart:
@@ -605,7 +646,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             if rpart:
                 filters.append(f"EndPin:^{rpart}.*")
             pteco_buckets.append({
-                "priority": 95,
+                "priority": pteco_idx,
                 "filters": filters,
                 "classification": "CLASSIF_PTECO",
                 "description": desc,
@@ -656,7 +697,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
 
         ext_buckets = []
         ext_bucketed = 0
-        bucket_idx = 0
+        bucket_idx = pteco_idx  # Continue priority numbering after PTECO
         for row in ext_groups.fetchall():
             lclk, cclk, ie, iec, sp, ep, cnt, worst_s, avg_s, worst_pct, avg_pct, avg_lol = row
             ext_bucketed += cnt
@@ -708,11 +749,24 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
                 "path_count": catchall_count,
             })
 
-        # Build compact summary for LLM classification (only the ext_buckets need IRIS labels)
+        # Build compact summary for LLM classification (PO_INT + C2C/EXT need IRIS labels)
         llm_summary = []
-        for i, b in enumerate(ext_buckets):
+        for i, b in enumerate(po_int_buckets):
             llm_summary.append({
                 "idx": i,
+                "type": "PO_INT",
+                "path_count": b["path_count"],
+                "classification": b["classification"],
+                "description": b["description"],
+                "worst_clock_pct": b.get("worst_clock_pct"),
+                "avg_clock_pct": b.get("avg_clock_pct"),
+                "worst_slack": b.get("worst_slack"),
+            })
+        offset = len(po_int_buckets)
+        for i, b in enumerate(ext_buckets):
+            llm_summary.append({
+                "idx": offset + i,
+                "type": "C2C_EXT",
                 "path_count": b["path_count"],
                 "classification": b["classification"],
                 "description": b["description"],
@@ -732,7 +786,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
                 "pteco": {"bucket_count": len(pteco_buckets), "total_paths": pteco_total},
                 "c2c_ext": {"bucket_count": len(ext_buckets), "total_paths": remaining_count},
             },
-            "c2c_ext_for_classification": llm_summary,
+            "buckets_for_classification": llm_summary,
             "_po_int_buckets": po_int_buckets,
             "_pteco_buckets": pteco_buckets,
             "_ext_buckets": ext_buckets,
@@ -1384,13 +1438,13 @@ def main():
             po_int_buckets = triage_data.get("_po_int_buckets", [])
             pteco_buckets = triage_data.get("_pteco_buckets", [])
             ext_buckets = triage_data.get("_ext_buckets", [])
-            ext_for_classif = triage_data.get("c2c_ext_for_classification", [])
+            buckets_for_classif = triage_data.get("buckets_for_classification", [])
             n_auto = len(po_int_buckets) + len(pteco_buckets) + len(ext_buckets)
             console.print(f"  Auto-bucketed: {po_int_count} PO_INT ({len(po_int_buckets)} buckets) + "
                           f"{pteco_count} PTECO ({len(pteco_buckets)} buckets) + "
                           f"{ext_count} C2C/EXT ({len(ext_buckets)} buckets)")
             console.print(f"  Total: {n_auto} auto-buckets covering all {total_failing} paths")
-            console.print(f"  LLM will classify {len(ext_for_classif)} C2C/EXT buckets with IRIS rules\n")
+            console.print(f"  LLM will classify {len(buckets_for_classif)} buckets with IRIS rules\n")
 
             # Store ALL auto-buckets for export — PO_INT + PTECO are final, ext_buckets may get LLM classification updates
             _auto_buckets_for_export.clear()
@@ -1398,7 +1452,7 @@ def main():
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
 
-            # Compact data for LLM: only the C2C/EXT bucket summaries to classify
+            # Compact data for LLM: bucket summaries to classify
             llm_data = {
                 "block": triage_data.get("block"),
                 "mode": triage_data.get("mode"),
@@ -1408,7 +1462,7 @@ def main():
                     "pteco": f"{pteco_count} paths in {len(pteco_buckets)} buckets",
                     "c2c_ext": f"{ext_count} paths in {len(ext_buckets)} buckets",
                 },
-                "c2c_ext_for_classification": ext_for_classif,
+                "buckets_for_classification": buckets_for_classif,
             }
             triage_json = json.dumps(llm_data, default=str)
 
@@ -1422,17 +1476,18 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"ALL {total_failing} paths are auto-bucketed by Python ({n_auto} buckets).\n"
-                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules, then call export.\n\n"
+                    f"Your ONLY job: review the {len(buckets_for_classif)} buckets in buckets_for_classification, "
+                    f"refine their IRIS classifications, then call export.\n\n"
                     f"Workflow:\n"
-                    f"1. Review each item in c2c_ext_for_classification (may be empty if all paths are PO_INT/PTECO).\n"
-                    f"2. Assign an IRIS classification to each bucket based on its stats:\n"
+                    f"1. Review each item in buckets_for_classification.\n"
+                    f"   Each has a pre-assigned classification — refine using IRIS rules:\n"
                     f"   - worst_clock_pct > 100% → CLASSIF_CONSTRAINTS\n"
                     f"   - avg_clock_pct 2-30% → CLASSIF_PO_OPT\n"
                     f"   - High avg levels_of_logic → HRP-001 → CLASSIF_FCT\n"
                     f"   - Otherwise → CLASSIF_FCT with specific IRIS rule\n"
-                    f"3. ALWAYS call export_bucket_file({export_params}, buckets=[]) — even if c2c_ext list is empty.\n"
-                    f"   Python will export ALL auto-buckets (PO_INT + PTECO + C2C/EXT). You MUST call this.\n"
-                    f"4. Print triage summary: for each C2C/EXT bucket, print classification + description."
+                    f"2. ALWAYS call export_bucket_file({export_params}, buckets=[]).\n"
+                    f"   Python will export ALL auto-buckets. You MUST call this.\n"
+                    f"3. Print triage summary: for each bucket group, print classification + stats."
                 )
             else:
                 triage_question = (
@@ -1441,17 +1496,18 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"ALL {total_failing} paths are auto-bucketed by Python ({n_auto} buckets).\n"
-                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules, then call export.\n\n"
+                    f"Your ONLY job: review the {len(buckets_for_classif)} buckets in buckets_for_classification, "
+                    f"refine their IRIS classifications, then call export.\n\n"
                     f"Workflow:\n"
-                    f"1. Review each item in c2c_ext_for_classification (may be empty if all paths are PO_INT/PTECO).\n"
-                    f"2. Assign IRIS classification using the waterfall (first match wins):\n"
+                    f"1. Review each item in buckets_for_classification.\n"
+                    f"   Each has a pre-assigned classification — refine using the IRIS waterfall:\n"
                     f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
                     f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
                     f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (2-30% window, by partition)\n"
                     f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
-                    f"3. ALWAYS call export_bucket_file({export_params}, buckets=[]) — even if c2c_ext list is empty.\n"
-                    f"   Python exports ALL {n_auto} auto-buckets (PO_INT + PTECO + C2C/EXT + catch-all). You MUST call this.\n"
-                    f"4. Print triage summary: C2C/EXT classifications, then PO_INT & PTECO totals."
+                    f"2. ALWAYS call export_bucket_file({export_params}, buckets=[]).\n"
+                    f"   Python exports ALL {n_auto} auto-buckets. You MUST call this.\n"
+                    f"3. Print triage summary: bucket classifications grouped by partition, then totals."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
