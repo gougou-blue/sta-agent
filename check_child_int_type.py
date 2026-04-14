@@ -23,21 +23,33 @@ else:
 print(f"Using: {csv}\n")
 con = duckdb.connect()
 
+def query(sql):
+    result = con.execute(sql)
+    cols = [d[0] for d in result.description]
+    rows = result.fetchall()
+    # Print as table
+    widths = [max(len(str(c)), max((len(str(r[i])) for r in rows), default=0)) for i, c in enumerate(cols)]
+    header = " | ".join(str(c).ljust(w) for c, w in zip(cols, widths))
+    print(header)
+    print("-+-".join("-" * w for w in widths))
+    for r in rows:
+        print(" | ".join(str(v).ljust(w) for v, w in zip(r, widths)))
+    print(f"({len(rows)} rows)\n")
+
 print("=== child_int_type x int_ext x int_ext_child (failing paths) ===")
-con.execute(f"""
+query(f"""
     SELECT child_int_type, int_ext, int_ext_child, COUNT(*) as cnt
     FROM read_csv_auto('{csv}')
     WHERE normal_slack < 0
     GROUP BY child_int_type, int_ext, int_ext_child
     ORDER BY cnt DESC
-""").show()
+""")
 
-print()
 print("=== thru_children breakdown for INT paths ===")
-con.execute(f"""
+query(f"""
     SELECT thru_children, child_int_type, COUNT(*) as cnt
     FROM read_csv_auto('{csv}')
     WHERE normal_slack < 0 AND int_ext = 'INT'
     GROUP BY thru_children, child_int_type
     ORDER BY cnt DESC
-""").show()
+""")
