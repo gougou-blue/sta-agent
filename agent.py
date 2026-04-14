@@ -540,34 +540,23 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         total_failing = sum_rows[0][0] if sum_rows else 0
 
         # ── Auto-bucket 1: Partition internals → CLASSIF_PO_INT ──
-        # Use int_ext='INT' AND int_ext_child='INT' as the reliable indicator.
-        # Derive partition name from the common startpoint prefix (first path component before /).
-        # Never rely solely on driver_partition/receiver_partition — they may be NULL in raw CSVs.
         po_int = con.execute(f"""
             SELECT
-                COALESCE(
-                    driver_partition,
-                    CASE WHEN POSITION('/' IN startpoint) > 0
-                         THEN SUBSTRING(startpoint, 1, POSITION('/' IN startpoint) - 1)
-                         ELSE 'unknown'
-                    END
-                ) as partition,
+                driver_partition as partition,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
             FROM {source}
             WHERE {where}
-              AND int_ext = 'INT'
-              AND (int_ext_child = 'INT' OR int_ext_child IS NULL)
-            GROUP BY partition
+              AND driver_partition = receiver_partition
+              AND (int_ext = 'INT' OR int_ext IS NULL)
+            GROUP BY driver_partition
             ORDER BY path_count DESC
         """, params)
         po_int_buckets = []
         po_int_total = 0
         for row in po_int.fetchall():
             part_name, count, worst_s, worst_pct = row
-            if not part_name or part_name == 'unknown':
-                continue
             po_int_total += count
             po_int_buckets.append({
                 "priority": 90,
@@ -578,7 +567,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
                 "path_count": count,
             })
 
-        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2, NOT internal) ──
+        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
@@ -589,7 +578,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             FROM {source}
             WHERE {where}
               AND clock_percentage < 2
-              AND NOT (int_ext = 'INT' AND (int_ext_child = 'INT' OR int_ext_child IS NULL))
+              AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))
             GROUP BY launch_clock, capture_clock, driver_partition, receiver_partition
             ORDER BY path_count DESC
         """, params)
@@ -614,10 +603,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             })
 
         # ── Remaining C2C/EXT paths: summarize for LLM ──
-        # Exclude internals (int_ext='INT' AND int_ext_child='INT') and PTECO (<2% window)
         remaining_where = (f"{where}"
             f" AND clock_percentage >= 2"
-            f" AND NOT (int_ext = 'INT' AND (int_ext_child = 'INT' OR int_ext_child IS NULL))")
+            f" AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
