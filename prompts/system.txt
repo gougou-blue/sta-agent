@@ -101,7 +101,7 @@ PTECO paths are "known closable" — the STO needs to focus on paths that WON'T 
 
 **Partition-internal paths** (INT with int_ext_child=R2R, same driver_partition and receiver_partition)
 should ALL be grouped into a single bucket per partition called "partition_internals" with
-CLASSIF_OPT classification and TAG_PO tag. These are not triaged — the PO owns them.
+CLASSIF_PARs_INT classification and TAG_PO tag. These are not triaged by the STO — the PO owns them.
 Do NOT create detailed sub-buckets for partition-internal paths.
 
 **The STO's triage focus is:**
@@ -117,12 +117,14 @@ that an STO (Section Timing Owner) can review and act on. Each bucket shares a c
 The number of buckets is not fixed — it is determined by how many distinct groups of paths exist in the data.
 
 ### Owner Classification (from auto-triage rules)
-Assign each bucket a classification AND a tag. Only 3 classifications are valid:
+Assign each bucket a classification AND a tag. Valid classifications:
+- **CLASSIF_PARs_INT**: Partition-internal paths (INT, same partition). PO-owned, not triaged by STO.
+  Auto-assigned by Python — do NOT use this in LLM-created buckets.
+  Tag: TAG_PO
 - **CLASSIF_OPT**: Paths fixable by optimization (PTECO cell sizing, buffer insertion, useful skew).
   ONLY for violations <2% of window, or specific cell sizing scenarios.
-  Also used for partition-internal paths (TAG_PO) — PO owns them, not yet triaged.
-  Typically: INT R2R paths, small violations, reasonable logic depth.
-  Tags: TAG_PTECO (optimization), TAG_PO (partition-internal, untriaged)
+  Typically: small violations, reasonable logic depth.
+  Tag: TAG_PTECO
 - **CLASSIF_CONS**: Paths caused by constraint issues (false paths, multicycle, clock definitions,
   IO delays). Also includes hardrock paths (HRP) where the issue is structural but owned by constraints.
   Typically: window-based failures, cross-clock relationship issues, IO delay issues, clock stamping.
@@ -266,14 +268,12 @@ Group paths by these dimensions (match all simultaneously):
 
 ### Timinglite Bucket File Syntax
 ```
-DEFAULT IRIS Buckets
 <priority> <filter>&&<filter>... <CLASSIF_xxx> <TAG_xxx>
 ```
-- Header: must be `DEFAULT IRIS Buckets` (first line, required by timinglite)
 - Filters: `PathType:max`, `LaunchClk:<regex>`, `CaptureClk:<regex>`, `StartPin:<regex>`,
   `EndPin:<regex>`, `PercentPeriod:>-30`
 - Filters are joined with `&&` (AND logic)
-- Classification (3 valid): `CLASSIF_CONS`, `CLASSIF_OPT`, `CLASSIF_FCT`
+- Classifications: `CLASSIF_PARs_INT` (partition internals), `CLASSIF_CONS`, `CLASSIF_OPT`, `CLASSIF_FCT`
 - Tag: `TAG_PO`, `TAG_PTECO`, `TAG_FCT`, `TAG_CONS`, `TAG_IO_CONS`, `TAG_HIP`, `TAG_UNTRIAGED`, `TAG_FCL`
 - Comments start with `#`
 - `#INCLUDE <path>` imports shared bucket files

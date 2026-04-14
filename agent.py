@@ -229,8 +229,8 @@ TOOL_SCHEMA = [
                             },
                             "classification": {
                                 "type": "string",
-                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT"],
-                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix)"
+                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT", "CLASSIF_PARs_INT"],
+                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix), CLASSIF_PARs_INT (partition internals, PO-owned, untriaged)"
                             },
                             "tag": {
                                 "type": "string",
@@ -632,7 +632,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 po_int_buckets.append({
                     "priority": 95,
                     "filters": filters,
-                    "classification": "CLASSIF_OPT",
+                    "classification": "CLASSIF_PARs_INT",
                     "tag": "TAG_PO",
                     "description": f"{sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
@@ -688,7 +688,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 po_int_buckets.append({
                     "priority": 95,
                     "filters": filters,
-                    "classification": "CLASSIF_OPT",
+                    "classification": "CLASSIF_PARs_INT",
                     "tag": "TAG_PO",
                     "description": f"INT {sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
                     "auto": True,
@@ -917,12 +917,9 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     """Write a timinglite-compatible bucket file.
 
     Format:
-      Header: DEFAULT IRIS Buckets
       Lines:  <priority> <filter&&filter&&...> <CLASSIF_xxx> <TAG_xxx>
     """
-    lines = [
-        f"DEFAULT IRIS Buckets",
-    ]
+    lines = []
 
     path_type = "max" if mode == "setup" else "min"
 
@@ -1249,7 +1246,7 @@ def handle_tool_call(con, tool_name, tool_input):
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
         # Strip any auto-bucketed classifications the LLM created — Python handles those
-        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT"}  # strip if LLM leaks old/wrong names
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT", "CLASSIF_PARs_INT"}  # strip if LLM leaks old/wrong names
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:
