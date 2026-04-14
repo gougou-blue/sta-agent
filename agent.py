@@ -191,7 +191,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "export_bucket_file",
-        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), an owner classification, and a root cause description. The bucket file can be loaded directly in Timing Lite.",
+        "description": "Generate a timinglite-compatible IRIS bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and a tag (TAG_PO/TAG_PTECO/TAG_FCT/TAG_CONS/TAG_HIP/TAG_IO_CONS/TAG_UNTRIAGED/TAG_FCL). The bucket file can be loaded directly in Timing Lite.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -220,7 +220,7 @@ TOOL_SCHEMA = [
                         "properties": {
                             "priority": {
                                 "type": "integer",
-                                "description": "Bucket priority (1 = highest)"
+                                "description": "Bucket priority (1 = default, higher = checked first)"
                             },
                             "filters": {
                                 "type": "array",
@@ -229,14 +229,20 @@ TOOL_SCHEMA = [
                             },
                             "classification": {
                                 "type": "string",
-                                "description": "Owner: CLASSIF_PTECO (auto-fix), CLASSIF_CONSTRAINTS (SDC issues), or CLASSIF_FCT (manual RTL/floorplan)"
+                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT"],
+                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix)"
+                            },
+                            "tag": {
+                                "type": "string",
+                                "enum": ["TAG_PO", "TAG_PTECO", "TAG_FCT", "TAG_CONS", "TAG_IO_CONS", "TAG_HIP", "TAG_UNTRIAGED", "TAG_FCL"],
+                                "description": "IRIS tag for the bucket category"
                             },
                             "description": {
                                 "type": "string",
-                                "description": "Root cause analysis and recommended fix action"
+                                "description": "Root cause analysis and recommended fix action (for logging only, not in output file)"
                             }
                         },
-                        "required": ["filters", "classification", "description"]
+                        "required": ["filters", "classification", "tag"]
                     }
                 }
             },
@@ -626,7 +632,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 po_int_buckets.append({
                     "priority": 95,
                     "filters": filters,
-                    "classification": "CLASSIF_PO_INT",
+                    "classification": "CLASSIF_FCT",
+                    "tag": "TAG_PO",
                     "description": f"{sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
                     "path_count": count,
@@ -636,7 +643,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 int_c2c_buckets.append({
                     "priority": 80,
                     "filters": filters,
-                    "classification": "INT_C2C",
+                    "classification": "CLASSIF_FCT",
+                    "tag": "TAG_PO",
                     "description": f"{sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
                     "path_count": count,
@@ -671,7 +679,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             pteco_buckets.append({
                 "priority": 50,
                 "filters": filters,
-                "classification": "CLASSIF_PTECO",
+                "classification": "CLASSIF_OPT",
+                "tag": "TAG_PTECO",
                 "description": desc,
                 "auto": True,
                 "path_count": count,
@@ -719,7 +728,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             ext_buckets.append({
                 "priority": 85,
                 "filters": filters,
-                "classification": "CLASSIF_PO_OPT",
+                "classification": "CLASSIF_FCT",
+                "tag": "TAG_PO",
                 "description": f"EXT {crossing}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                 "auto": True,
                 "path_count": count,
@@ -848,22 +858,14 @@ def _sanitize_filter_regex(filter_str):
 
 
 def export_bucket_file(buckets, output_path, block, run_label, mode):
-    """Write a timinglite-compatible bucket file.
+    """Write a timinglite-compatible IRIS bucket file.
 
-    Args:
-        buckets: list of dicts with keys: priority, filters, classification, description
-        output_path: path to write the bucket file
-        block: block name
-        run_label: run label
-        mode: setup or hold
+    Real IRIS format:
+      Header: DEFAULT IRIS Buckets
+      Lines:  <priority> <filter&&filter&&...> <CLASSIF_xxx> <TAG_xxx>
     """
     lines = [
-        f"# STA Agent Auto-Triage Bucket File",
-        f"# Block: {block}  Run: {run_label}  Mode: {mode}",
-        f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"#",
-        f"# Load in Timing Lite: timinglite.py --bucket <this_file> <report>",
-        f"#",
+        f"DEFAULT IRIS Buckets",
     ]
 
     path_type = "max" if mode == "setup" else "min"
@@ -875,10 +877,10 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         raw_filters = [f for f in raw_filters if not f.startswith("PathType:")]
         filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
         classification = bucket.get("classification", "")
-        description = bucket.get("description", "").replace("\n", " ")
+        tag = bucket.get("tag", "TAG_PO")
 
         filter_str = "&&".join(filters)
-        lines.append(f"{priority} {filter_str} {classification} {description}")
+        lines.append(f"{priority} {filter_str} {classification} {tag}")
 
     content = "\n".join(lines) + "\n"
 
@@ -939,8 +941,9 @@ def _csv_source_with_aliases(con, csv_path):
         col_or_null("int_ext"),
         col_or_null("int_ext_child"),
         col_or_null("child_int_type"),
-        col_or_null("driver_partition"),
-        col_or_null("receiver_partition"),
+        col_or_null("thru_children"),
+        col_or_null("driver_partition", "start_par"),
+        col_or_null("receiver_partition", "end_par"),
         col_or_null("levels_of_logic", "number_data_cells", cast_to="INTEGER"),
         col_or_null("path_type", "path_delay_type"),
     ]
@@ -1186,7 +1189,7 @@ def handle_tool_call(con, tool_name, tool_input):
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
         # Strip any auto-bucketed classifications the LLM created — Python handles those
-        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C"}  # strip if LLM leaks these
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT"}  # strip if LLM leaks old/wrong names
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:

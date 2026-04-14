@@ -99,9 +99,9 @@ PTECO paths are "known closable" — the STO needs to focus on paths that WON'T 
 - **PO (Partition Owner)**: Runs Fusion Compiler to build each partition.
   Owns all **INT (internal)** paths within their partition.
 
-**Partition-internal paths (INT with int_ext_child=R2R, same driver_partition and receiver_partition)**
+**Partition-internal paths** (INT with int_ext_child=R2R, same driver_partition and receiver_partition)
 should ALL be grouped into a single bucket per partition called "partition_internals" with
-CLASSIF_PO_INT classification. STOs don't triage these individually — they just tell the PO
+CLASSIF_FCT classification and TAG_PO tag. STOs don't triage these individually — they just tell the PO
 to fix them. Do NOT create detailed sub-buckets for partition-internal paths.
 
 **The STO's triage focus is:**
@@ -117,28 +117,22 @@ that an STO (Section Timing Owner) can review and act on. Each bucket shares a c
 The number of buckets is not fixed — it is determined by how many distinct groups of paths exist in the data.
 
 ### Owner Classification (from IRIS auto-triage)
-Assign each bucket one of these owners:
-- **CLASSIF_PTECO**: Paths fixable by the automatic PTECO timing ECO tool (cell sizing, buffer insertion).
+Assign each bucket a classification AND a tag. Only 3 classifications are valid:
+- **CLASSIF_OPT**: Paths fixable by optimization (PTECO cell sizing, buffer insertion, useful skew).
   ONLY for violations <2% of window, or specific cell sizing scenarios.
   Typically: INT R2R paths, small violations, reasonable logic depth.
-- **CLASSIF_CONSTRAINTS**: Paths caused by SDC/constraint issues (false paths, multicycle, clock definitions).
-  Also includes hardrock paths (HRP) where the issue is structural but owned by constraints.
+  Tag: TAG_PTECO
+- **CLASSIF_CONS**: Paths caused by constraint issues (false paths, multicycle, clock definitions,
+  IO delays). Also includes hardrock paths (HRP) where the issue is structural but owned by constraints.
   Typically: window-based failures, cross-clock relationship issues, IO delay issues, clock stamping.
-- **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes).
-  Includes structural issues, cross-partition bottlenecks, feedthrough problems, deep logic,
-  large PHY/HIP delays, placement issues, skew fixes, manual optimization.
-- **CLASSIF_PO_OPT**: Partition Owner to Optimize. C2C/EXT paths with moderate violations (2-30% of window)
-  that need standard optimization by the partition owner: useful skew, cell sizing, buffer insertion,
-  logic restructuring. These are NOT auto-fixable by PTECO (too large) but NOT structural/constraint
-  issues either — they are normal optimization work the partition owner must drive.
-  Group PO_OPT buckets by partition (driver_partition or receiver_partition) so the right owner is clear.
-- **CLASSIF_PO_INT**: Partition Owner Internals. ALL paths that are completely internal to a partition
-  (int_ext='INT', driver_partition = receiver_partition). Create ONE bucket per partition, NOT detailed
-  sub-buckets. STOs don't triage these — they just tell the PO to fix them. Use filter like:
-  `StartPin:^<partition_name>.*&&EndPin:^<partition_name>.*`
+  Tags: TAG_CONS, TAG_IO_CONS, TAG_HIP
+- **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes,
+  partition owner optimization, structural fixes). Includes cross-partition bottlenecks,
+  feedthrough problems, deep logic, large PHY/HIP delays, placement issues, skew fixes.
+  Also used for partition-internal paths and cross-partition EXT paths.
+  Tags: TAG_PO, TAG_FCT, TAG_UNTRIAGED, TAG_FCL
 
-**PTECO reality check**: PTECO is an incremental optimization tool. It can fix small violations
-through cell sizing and useful skew. It CANNOT fix paths failing by 50%, 100%, or 300% of the cycle.
+**Partition-internal paths** (INT, same driver_partition and receiver_partition):
 
 ### IRIS Auto-Triage Rule Categories (reference for bucket classification)
 Use these as a guide when classifying buckets. You don't need to match rules exactly,
@@ -232,13 +226,12 @@ For each path, evaluate these stages in order. Assign the path to the FIRST stag
    Identify feedthrough paths that are missing or incorrectly buffered.
    Rules: FTC-001.
 
-3. **Optimization Check** → ECO Tool (PTECO) or PO_OPT owner
-   Determine if violation can be resolved via PTECO (<2% window) or partition owner optimization
-   (2-30% window: useful skew, sizing, buffering). Paths with moderate violations that aren't
-   constraint or structural issues go here — classified by partition.
+3. **Optimization Check** → CLASSIF_OPT TAG_PTECO
+   Determine if violation can be resolved via PTECO (<2% window) or partition owner optimization.
+   Paths with moderate violations that aren't constraint or structural issues go here.
    Rules: ECO-001 through ECO-007.
 
-4. **Additional Check** → FCT / RTL owner
+4. **Additional Check** → CLASSIF_FCT TAG_PO/TAG_FCT
    Remaining issues: hardrock paths, high logic depth, placement issues, skew problems,
    manual fixes, and anything requiring deeper investigation.
    Rules: HRP-001 through HRP-011, MOP-001 through MOP-013, SKW-001 through SKW-008, MSC-001 through MSC-004.
@@ -270,15 +263,17 @@ Group paths by these dimensions (match all simultaneously):
 5. Look for specific hardware issues: large delay through a specific block (PHY, clock buffers),
    missing checkpoints, clock stamping issues, placement problems causing long routes.
 
-### Timinglite Bucket File Syntax
+### Timinglite Bucket File Syntax (IRIS format)
 ```
-<priority> <filter>&&<filter>... <CLASSIFICATION> <description>
+DEFAULT IRIS Buckets
+<priority> <filter>&&<filter>... <CLASSIF_xxx> <TAG_xxx>
 ```
+- Header: must be `DEFAULT IRIS Buckets` (first line)
 - Filters: `PathType:max`, `LaunchClk:<regex>`, `CaptureClk:<regex>`, `StartPin:<regex>`,
   `EndPin:<regex>`, `PercentPeriod:>-30`
 - Filters are joined with `&&` (AND logic)
-- Classification tags: `CLASSIF_PTECO`, `CLASSIF_CONSTRAINTS`, `CLASSIF_FCT`
-- Description: plain text root cause + recommended fix
+- Classification (3 valid): `CLASSIF_CONS`, `CLASSIF_OPT`, `CLASSIF_FCT`
+- Tag: `TAG_PO`, `TAG_PTECO`, `TAG_FCT`, `TAG_CONS`, `TAG_IO_CONS`, `TAG_HIP`, `TAG_UNTRIAGED`, `TAG_FCL`
 - Comments start with `#`
 - `#INCLUDE <path>` imports shared bucket files
 - Column name mapping: launch_clock→LaunchClk, capture_clock→CaptureClk,
