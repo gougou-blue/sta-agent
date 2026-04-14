@@ -101,8 +101,8 @@ PTECO paths are "known closable" — the STO needs to focus on paths that WON'T 
 
 **Partition-internal paths** (INT with int_ext_child=R2R, same driver_partition and receiver_partition)
 should ALL be grouped into a single bucket per partition called "partition_internals" with
-CLASSIF_FCT classification and TAG_PO tag. STOs don't triage these individually — they just tell the PO
-to fix them. Do NOT create detailed sub-buckets for partition-internal paths.
+CLASSIF_OPT classification and TAG_PO tag. These are not triaged — the PO owns them.
+Do NOT create detailed sub-buckets for partition-internal paths.
 
 **The STO's triage focus is:**
 1. C2C paths crossing partition boundaries (driver_partition != receiver_partition)
@@ -120,16 +120,17 @@ The number of buckets is not fixed — it is determined by how many distinct gro
 Assign each bucket a classification AND a tag. Only 3 classifications are valid:
 - **CLASSIF_OPT**: Paths fixable by optimization (PTECO cell sizing, buffer insertion, useful skew).
   ONLY for violations <2% of window, or specific cell sizing scenarios.
+  Also used for partition-internal paths (TAG_PO) — PO owns them, not yet triaged.
   Typically: INT R2R paths, small violations, reasonable logic depth.
-  Tag: TAG_PTECO
+  Tags: TAG_PTECO (optimization), TAG_PO (partition-internal, untriaged)
 - **CLASSIF_CONS**: Paths caused by constraint issues (false paths, multicycle, clock definitions,
   IO delays). Also includes hardrock paths (HRP) where the issue is structural but owned by constraints.
   Typically: window-based failures, cross-clock relationship issues, IO delay issues, clock stamping.
   Tags: TAG_CONS, TAG_IO_CONS, TAG_HIP
-- **CLASSIF_FCT**: Paths requiring manual intervention (RTL changes, floorplan, placement fixes,
-  partition owner optimization, structural fixes). Includes cross-partition bottlenecks,
+- **CLASSIF_FCT**: Paths requiring manual STO intervention (floorplan, placement fixes,
+  cross-partition coordination, structural fixes). Includes cross-partition bottlenecks,
   feedthrough problems, deep logic, large PHY/HIP delays, placement issues, skew fixes.
-  Also used for partition-internal paths and cross-partition EXT paths.
+  Also used for cross-partition EXT paths that need STO coordination.
   Tags: TAG_PO, TAG_FCT, TAG_UNTRIAGED, TAG_FCL
 
 **Partition-internal paths** (INT, same driver_partition and receiver_partition):

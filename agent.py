@@ -632,7 +632,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 po_int_buckets.append({
                     "priority": 95,
                     "filters": filters,
-                    "classification": "CLASSIF_FCT",
+                    "classification": "CLASSIF_OPT",
                     "tag": "TAG_PO",
                     "description": f"{sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
