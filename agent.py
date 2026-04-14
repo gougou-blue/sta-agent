@@ -624,9 +624,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             if same_leaf:
                 po_int_total += count
                 po_int_buckets.append({
-                    "priority": 90,
+                    "priority": 95,
                     "filters": filters,
-                    "classification": "Partition_Internals",
+                    "classification": "CLASSIF_PO_INT",
                     "description": f"{sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
                     "path_count": count,
@@ -634,7 +634,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             else:
                 int_c2c_total += count
                 int_c2c_buckets.append({
-                    "priority": 85,
+                    "priority": 80,
                     "filters": filters,
                     "classification": "INT_C2C",
                     "description": f"{sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
@@ -669,7 +669,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             if rpart:
                 filters.append(f"EndPin:^{rpart}.*")
             pteco_buckets.append({
-                "priority": 95,
+                "priority": 50,
                 "filters": filters,
                 "classification": "CLASSIF_PTECO",
                 "description": desc,
@@ -707,15 +707,19 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 crossing = sp_n1
             else:
                 crossing = f"{sp_n1}->{ep_n1}"
-            filters = [f"StartPin:^{sp_n1}/.*", f"EndPin:^{ep_n1}/.*"]
+            # Build pin filters: use ^prefix/.* for hierarchical pins,
+            # ^prefix$ for port-level pins (no / in name)
+            sp_filter = f"StartPin:^{sp_n1}(/.*|$)" if '/' not in sp_n1 else f"StartPin:^{sp_n1}/.*"
+            ep_filter = f"EndPin:^{ep_n1}(/.*|$)" if '/' not in ep_n1 else f"EndPin:^{ep_n1}/.*"
+            filters = [sp_filter, ep_filter]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
                 filters.append(f"CaptureClk:{cclk}")
             ext_buckets.append({
-                "priority": 80,
+                "priority": 85,
                 "filters": filters,
-                "classification": "EXT_C2C",
+                "classification": "CLASSIF_PO_OPT",
                 "description": f"EXT {crossing}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                 "auto": True,
                 "path_count": count,
@@ -1182,7 +1186,7 @@ def handle_tool_call(con, tool_name, tool_input):
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
         # Strip any auto-bucketed classifications the LLM created — Python handles those
-        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C"}
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C"}  # strip if LLM leaks these
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:
@@ -1193,8 +1197,9 @@ def handle_tool_call(con, tool_name, tool_input):
                 filtered_llm.append(b)
         if stripped:
             console.print(f"  [dim]Stripped {stripped} LLM-generated auto-bucketed classifications (Python handles those)[/dim]")
-        # Merge: LLM INT_C2C buckets first (higher priority), then auto-buckets at the end
+        # Merge: sort all buckets by priority descending (timinglite checks higher priority first)
         all_buckets = filtered_llm + list(_auto_buckets_for_export)
+        all_buckets.sort(key=lambda b: b.get('priority', 1), reverse=True)
         console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
         console.print(f"  [dim]{len(filtered_llm)} LLM buckets + {len(_auto_buckets_for_export)} auto-buckets[/dim]\n")
         result = export_bucket_file(all_buckets, output_path, block, run_label, mode)
