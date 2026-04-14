@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-"""Quick script to inspect child_int_type values in memstack CSV."""
-import duckdb
+"""Quick script to inspect child_int_type values in a timing CSV."""
+import duckdb, sys, os
 
-csv = "/nfs/site/disks/nwp_fct_0004/darylkow/memstack_default_stamping/runs/memstack/1276.5_dot4/sta_pt/func.nom.TT_100.tttt/reports/memstack.func.nom.TT_100.tttt.report_summary.max.csv.gz"
+candidates = [
+    "/nfs/site/disks/nwp_fct_0004/darylkow/memstack_default_stamping/runs/memstack/1276.5_dot4/sta_pt/func.nom.TT_100.tttt/reports/memstack.func.nom.TT_100.tttt.report_summary.max.csv.gz",
+    "/nfs/site/disks/nwp_fct_0004/darylkow/memstack_0p5_26ww11.2/runs/memstack/1276.5_dot4/sta_pt/func.nom.TT_100.tttt/reports/memstack.func.nom.TT_100.tttt.report_summary.max.csv.gz",
+]
 
+# Allow passing CSV path as argument
+if len(sys.argv) > 1:
+    csv = sys.argv[1]
+else:
+    csv = None
+    for c in candidates:
+        if os.path.exists(c):
+            csv = c
+            break
+    if not csv:
+        print("No CSV found. Pass path as argument: python3 check_child_int_type.py <csv_path>")
+        sys.exit(1)
+
+print(f"Using: {csv}\n")
 con = duckdb.connect()
 
 print("=== child_int_type x int_ext x int_ext_child (failing paths) ===")
