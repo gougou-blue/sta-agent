@@ -191,7 +191,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "export_bucket_file",
-        "description": "Generate a timinglite-compatible IRIS bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and a tag (TAG_PO/TAG_PTECO/TAG_FCT/TAG_CONS/TAG_HIP/TAG_IO_CONS/TAG_UNTRIAGED/TAG_FCL). The bucket file can be loaded directly in Timing Lite.",
+        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and a tag (TAG_PO/TAG_PTECO/TAG_FCT/TAG_CONS/TAG_HIP/TAG_IO_CONS/TAG_UNTRIAGED/TAG_FCL). The bucket file can be loaded directly in Timing Lite.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -235,11 +235,11 @@ TOOL_SCHEMA = [
                             "tag": {
                                 "type": "string",
                                 "enum": ["TAG_PO", "TAG_PTECO", "TAG_FCT", "TAG_CONS", "TAG_IO_CONS", "TAG_HIP", "TAG_UNTRIAGED", "TAG_FCL"],
-                                "description": "IRIS tag for the bucket category"
+                                "description": "Tag for the bucket category"
                             },
                             "description": {
                                 "type": "string",
-                                "description": "Root cause analysis and recommended fix action (for logging only, not in output file)"
+                                "description": "Root cause analysis and recommended fix — written as # comment in bucket file so timinglite users understand why this bucket is failing"
                             }
                         },
                         "required": ["filters", "classification", "tag"]
@@ -650,6 +650,62 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                     "path_count": count,
                 })
 
+        # ── Auto-bucket 1b: Remaining INT paths (not INT_AllChildren) ──
+        # These may have child_int_type like INT_SomeChildren or NULL.
+        # Group by driver_partition × receiver_partition × clock domain.
+        other_int = con.execute(f"""
+            SELECT
+                COALESCE(driver_partition, split_part(startpoint, '/', 1)) as sp_part,
+                COALESCE(receiver_partition, split_part(endpoint, '/', 1)) as ep_part,
+                launch_clock, capture_clock,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
+            FROM {source}
+            WHERE {where}
+              AND int_ext = 'INT'
+              AND NOT ({int_exclude_cond})
+            GROUP BY sp_part, ep_part, launch_clock, capture_clock
+            ORDER BY path_count DESC
+        """, params)
+        for row in other_int.fetchall():
+            sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            if not sp_part:
+                continue
+            same_part = (sp_part == ep_part)
+            if leaf_depth == 1:
+                filters = [f"StartPin:^{sp_part}/.*", f"EndPin:^{ep_part}/.*"]
+            else:
+                filters = [f"StartPin:.*/{sp_part}/.*", f"EndPin:.*/{ep_part}/.*"]
+            if lclk:
+                filters.append(f"LaunchClk:{lclk}")
+            if cclk:
+                filters.append(f"CaptureClk:{cclk}")
+            if same_part:
+                po_int_total += count
+                po_int_buckets.append({
+                    "priority": 95,
+                    "filters": filters,
+                    "classification": "CLASSIF_OPT",
+                    "tag": "TAG_PO",
+                    "description": f"INT {sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
+                    "auto": True,
+                    "path_count": count,
+                })
+            else:
+                int_c2c_total += count
+                int_c2c_buckets.append({
+                    "priority": 80,
+                    "filters": filters,
+                    "classification": "CLASSIF_FCT",
+                    "tag": "TAG_PO",
+                    "description": f"INT C2C {sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
+                    "auto": True,
+                    "path_count": count,
+                })
+
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
@@ -735,9 +791,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "path_count": count,
             })
 
-        # ── Remaining: only INT_C2C for LLM (if leaf_depth > 1) ──
+        # ── Remaining: anything not already auto-bucketed ──
         remaining_where = (f"{where}"
-            f" AND NOT ({int_exclude_cond})"
+            f" AND NOT (int_ext = 'INT')"
             f" AND NOT (int_ext = 'EXT')"
             f" AND NOT (clock_percentage >= 0 AND clock_percentage < 2)")
 
@@ -826,7 +882,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "startpoint_prefixes": sp_rows,
                 "endpoint_prefixes": ep_rows,
                 "worst_paths": {"columns": worst_cols, "rows": worst_rows},
-                "note": "These are INT_C2C paths. Classify using IRIS waterfall.",
+                "note": "These are INT_C2C paths. Classify using the waterfall rules.",
             },
         }
     except Exception as e:
@@ -858,9 +914,9 @@ def _sanitize_filter_regex(filter_str):
 
 
 def export_bucket_file(buckets, output_path, block, run_label, mode):
-    """Write a timinglite-compatible IRIS bucket file.
+    """Write a timinglite-compatible bucket file.
 
-    Real IRIS format:
+    Format:
       Header: DEFAULT IRIS Buckets
       Lines:  <priority> <filter&&filter&&...> <CLASSIF_xxx> <TAG_xxx>
     """
@@ -879,6 +935,10 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         classification = bucket.get("classification", "")
         tag = bucket.get("tag", "TAG_PO")
 
+        # Write description as comment above the bucket line
+        desc = bucket.get("description", "")
+        if desc:
+            lines.append(f"# {desc}")
         filter_str = "&&".join(filters)
         lines.append(f"{priority} {filter_str} {classification} {tag}")
 
@@ -1459,18 +1519,18 @@ def main():
             int_c2c_count = auto.get("int_c2c", {}).get("total_paths", 0)
             ext_count = auto.get("ext", {}).get("total_paths", 0)
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
-            auto_total = po_int_count + pteco_count + ext_count
-            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
-            console.print(f"  INT_C2C for LLM: {int_c2c_count} paths ({len(int_c2c_buckets)} groups)")
+            auto_total = po_int_count + int_c2c_count + pteco_count + ext_count
+            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
             # Store ALL auto_buckets for merging at export time
             _auto_buckets_for_export.clear()
             _auto_buckets_for_export.extend(po_int_buckets)
+            _auto_buckets_for_export.extend(int_c2c_buckets)
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
 
-            # Only send INT_C2C reference + remaining to LLM
+            # Only send remaining to LLM (all INT/EXT/PTECO are auto-bucketed)
             llm_data = {
                 "block": triage_data.get("block"),
                 "mode": triage_data.get("mode"),
@@ -1478,18 +1538,14 @@ def main():
                 "auto_bucket_summary": {
                     "partition_internals_paths": po_int_count,
                     "partition_internals_buckets": len(po_int_buckets),
+                    "int_c2c_paths": int_c2c_count,
+                    "int_c2c_buckets": len(int_c2c_buckets),
                     "ext_paths": ext_count,
                     "ext_buckets": len(ext_buckets),
                     "pteco_paths": pteco_count,
                     "pteco_buckets": len(pteco_buckets),
-                    "int_c2c_paths": int_c2c_count,
-                    "int_c2c_groups": len(int_c2c_buckets),
-                    "note": "Partition_Internals, EXT, and PTECO are fully handled by Python. You only handle INT_C2C.",
+                    "note": "ALL INT, EXT, and PTECO paths are fully handled by Python auto-bucketing.",
                 },
-                "int_c2c_reference": [
-                    {"description": b["description"], "path_count": b["path_count"]}
-                    for b in int_c2c_buckets
-                ] if int_c2c_buckets else [],
                 "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
             }
             triage_json = json.dumps(llm_data, default=str)
@@ -1509,45 +1565,47 @@ def main():
                     f"You are triaging as a PARTITION OWNER (PO) for partition '{partition}'.\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
-                    f"IMPORTANT: {po_int_count} PO_INT paths and {pteco_count} PTECO paths are already\n"
-                    f"auto-bucketed by Python. Do NOT include them in your bucket list.\n"
+                    f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
+                    f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
+                    f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
+                    f"  - {ext_count} EXT ({len(ext_buckets)} buckets)\n"
+                    f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
                     f"Python will automatically merge them into the export.\n\n"
-                    f"Your job: create buckets ONLY for the {remaining} remaining C2C/EXT paths.\n\n"
+                    f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n\n"
                     f"Workflow:\n"
-                    f"1. Use remaining_c2c_ext groups, prefixes, and worst paths to create buckets.\n"
-                    f"2. Classify using IRIS waterfall. As a PO, your actions are:\n"
-                    f"   - ECO-003/004: Cell sizing in Fusion Compiler recipe\n"
-                    f"   - MOP-001: Long net / high fanout fixes\n"
-                    f"   - HRP-001: High logic depth — pipeline insertion or RTL restructuring\n"
+                    f"1. If remaining paths exist, use remaining_c2c_ext groups and worst paths to create buckets.\n"
+                    f"2. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
                     f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"4. Call export_bucket_file({export_params}, buckets=<your C2C/EXT buckets only>).\n"
+                    f"4. Call export_bucket_file({export_params}, buckets=<your remaining buckets only>).\n"
+                    f"   If no remaining paths, pass buckets=[].\n"
                     f"5. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
-                auto_count = len(po_int_buckets) + len(pteco_buckets) + len(ext_buckets)
+                auto_count = len(po_int_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
                 triage_question = (
                     f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n\n"
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
-                    f"IMPORTANT: Python has already auto-bucketed:\n"
+                    f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
+                    f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
                     f"  - {ext_count} EXT paths ({len(ext_buckets)} buckets)\n"
                     f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
-                    f"Do NOT include these in your bucket list. Python will merge them.\n\n"
-                    f"Your job: create buckets ONLY for the {int_c2c_count} INT_C2C paths.\n"
-                    f"These are internal paths crossing partition boundaries (STO's responsibility).\n\n"
+                    f"Python will merge all {auto_count} auto-buckets into the export.\n\n"
+                    f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n"
+                    f"These are paths not matching INT, EXT, or PTECO categories.\n\n"
                     f"Workflow:\n"
-                    f"1. Use int_c2c_reference and remaining_c2c_ext data to create INT_C2C buckets.\n"
+                    f"1. If remaining paths exist, use remaining_c2c_ext data to create buckets.\n"
                     f"   Do NOT call query_timing_db — the data is already summarized.\n"
-                    f"2. Group by partition pair + clock domain.\n"
-                    f"3. Classify using IRIS waterfall: HRP (high logic depth), ECO (small slack), etc.\n"
-                    f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
+                    f"2. Classify: HRP (high logic depth), ECO (small slack), CON (constraints).\n"
+                    f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"5. Call export_bucket_file({export_params}, buckets=<your INT_C2C buckets only>).\n"
+                    f"4. Call export_bucket_file({export_params}, buckets=<your remaining buckets only>).\n"
                     f"   Python will prepend the {auto_count} auto-buckets.\n"
-                    f"6. Print triage summary: bucket #, classification, path count, worst slack."
+                    f"   If no remaining paths, pass buckets=[].\n"
+                    f"5. Print triage summary: bucket #, classification, path count, worst slack."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)

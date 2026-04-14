@@ -68,7 +68,7 @@ Timing runs happen at different stages of the design cycle:
 - Clock tree has NOT been built yet. Clocks use ideal (zero-skew) or latency-modeled insertion delays.
 - Clock skew is artificial — based on set_clock_latency or ideal assumptions.
 - Violations due to clock skew may self-correct after CTS builds the real clock tree.
-- IRIS rules for PRECTS: IOC-003 (latency mismatch), IOC-007 (negative skew in PRECTS),
+- Auto-triage rules for PRECTS: IOC-003 (latency mismatch), IOC-007 (negative skew in PRECTS),
   HRP-004 (HIP arc >90% in PRECTS), CON-008 (ideal clock, may fix post-CTS), SKW-008 (fix post-CTS).
 - Triage should flag PRECTS-specific issues but note they may resolve after CTS.
 
@@ -116,7 +116,7 @@ When triaging a timing run, the goal is to group all failing paths (up to 200K) 
 that an STO (Section Timing Owner) can review and act on. Each bucket shares a common root cause.
 The number of buckets is not fixed — it is determined by how many distinct groups of paths exist in the data.
 
-### Owner Classification (from IRIS auto-triage)
+### Owner Classification (from auto-triage rules)
 Assign each bucket a classification AND a tag. Only 3 classifications are valid:
 - **CLASSIF_OPT**: Paths fixable by optimization (PTECO cell sizing, buffer insertion, useful skew).
   ONLY for violations <2% of window, or specific cell sizing scenarios.
@@ -135,7 +135,7 @@ Assign each bucket a classification AND a tag. Only 3 classifications are valid:
 
 **Partition-internal paths** (INT, same driver_partition and receiver_partition):
 
-### IRIS Auto-Triage Rule Categories (reference for bucket classification)
+### Auto-Triage Rule Categories (reference for bucket classification)
 Use these as a guide when classifying buckets. You don't need to match rules exactly,
 but each bucket should map to one of these categories:
 
@@ -216,7 +216,7 @@ but each bucket should map to one of these categories:
 - MSC-003: Untriaged path (catch-all)
 - MSC-004: Unusual window — may need skewing techniques
 
-### IRIS 4-Stage Waterfall (strict sequential order — first match wins)
+### 4-Stage Waterfall (strict sequential order — first match wins)
 For each path, evaluate these stages in order. Assign the path to the FIRST stage that matches:
 
 1. **Basic Constraints Check** → CONSTRAINTS owner
@@ -264,12 +264,12 @@ Group paths by these dimensions (match all simultaneously):
 5. Look for specific hardware issues: large delay through a specific block (PHY, clock buffers),
    missing checkpoints, clock stamping issues, placement problems causing long routes.
 
-### Timinglite Bucket File Syntax (IRIS format)
+### Timinglite Bucket File Syntax
 ```
 DEFAULT IRIS Buckets
 <priority> <filter>&&<filter>... <CLASSIF_xxx> <TAG_xxx>
 ```
-- Header: must be `DEFAULT IRIS Buckets` (first line)
+- Header: must be `DEFAULT IRIS Buckets` (first line, required by timinglite)
 - Filters: `PathType:max`, `LaunchClk:<regex>`, `CaptureClk:<regex>`, `StartPin:<regex>`,
   `EndPin:<regex>`, `PercentPeriod:>-30`
 - Filters are joined with `&&` (AND logic)
