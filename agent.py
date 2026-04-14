@@ -1426,7 +1426,7 @@ def main():
                     "note": "Partition_Internals and PTECO are handled by Python. INT_C2C paths are in the remaining data — classify them as INT_C2C or appropriate IRIS category.",
                 },
                 "int_c2c_reference": [
-                    {"sp_part": b["filters"][0].split("^")[1].rstrip(".*"), "ep_part": b["filters"][1].split("^")[1].rstrip(".*"), "description": b["description"]}
+                    {"description": b["description"], "path_count": b["path_count"]}
                     for b in int_c2c_buckets
                 ] if int_c2c_buckets else [],
                 "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
