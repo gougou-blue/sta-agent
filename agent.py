@@ -501,6 +501,44 @@ def read_report_file(block=None, run_label=None, mode=None, report_name=None,
         }
 
 
+def _classify_bucket(worst_pct, avg_pct, avg_lol, worst_slack, launch_clk, capture_clk):
+    """IRIS waterfall heuristic for auto-classifying a bucket.
+
+    Uses clock_percentage when available, falls back to slack/lol/clock-domain.
+    """
+    # Stage 1: Constraints check (clock_percentage > 100% means over-constrained)
+    if worst_pct is not None and worst_pct > 100:
+        return "CLASSIF_CONSTRAINTS"
+    # Cross-domain paths with scan clocks → likely constraints
+    if launch_clk and capture_clk and launch_clk != capture_clk:
+        scan_keywords = ("scan", "fscan", "ctf", "ovrd", "jtag", "bist", "atpg")
+        lclk_lower = launch_clk.lower()
+        cclk_lower = capture_clk.lower()
+        if any(k in lclk_lower or k in cclk_lower for k in scan_keywords):
+            return "CLASSIF_CONSTRAINTS"
+
+    # Stage 2: Optimization window (2-30% of period)
+    if avg_pct is not None and 0 < avg_pct <= 30:
+        return "CLASSIF_PO_OPT"
+
+    # Stage 3: High logic depth → HRP (pipeline restructure opportunity)
+    if avg_lol is not None and avg_lol >= 30:
+        return "CLASSIF_FCT"  # HRP-001: high register-to-register path depth
+
+    # Stage 4: Moderate slack → optimization candidate
+    if worst_slack is not None and avg_pct is None:
+        # No clock_percentage: use absolute slack as proxy
+        if worst_slack > -50:
+            return "CLASSIF_PO_OPT"  # Small slack → likely optimizable
+        elif avg_lol is not None and avg_lol >= 20:
+            return "CLASSIF_FCT"  # Moderate depth + large slack
+        else:
+            return "CLASSIF_PO_OPT"  # Default to PO optimization
+
+    # Default
+    return "CLASSIF_PO_OPT"
+
+
 def triage_timing_run(con, block, run_label, mode, csv_path=None):
     """Analyze failing paths and group into triage bucket candidates.
 
@@ -594,16 +632,13 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             if ep:
                 filters.append(f"EndPin:^{ep}.*")
 
-            # Pre-classify based on stats
-            if worst_pct and worst_pct > 100:
-                classif = "CLASSIF_CONSTRAINTS"
-            elif avg_pct and avg_pct <= 30:
-                classif = "CLASSIF_PO_OPT"
-            else:
-                classif = "CLASSIF_PO_INT"
+            # Pre-classify based on stats (IRIS waterfall heuristic)
+            classif = _classify_bucket(worst_pct, avg_pct, avg_lol, worst_s, lclk, cclk)
 
+            pct_str = f"{worst_pct}%w" if worst_pct is not None else "N/A"
+            avg_pct_str = f"{avg_pct}%w" if avg_pct is not None else "N/A"
             desc = (f"PO_INT {part_name}: {lclk}->{cclk} {sp}->{ep} "
-                    f"({count} paths, worst {worst_s}ps/{worst_pct}%w, avg {avg_s}ps/{avg_pct}%w, "
+                    f"({count} paths, worst {worst_s}ps/{pct_str}, avg {avg_s}ps/{avg_pct_str}, "
                     f"avg_lol={avg_lol})")
             po_int_buckets.append({
                 "priority": po_int_idx,
@@ -712,17 +747,14 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             if ep:
                 filters.append(f"EndPin:^{ep}.*")
 
-            # Pre-classify obvious cases; LLM will refine
-            if worst_pct and worst_pct > 100:
-                classif = "CLASSIF_CONSTRAINTS"
-            elif avg_pct and avg_pct <= 30:
-                classif = "CLASSIF_PO_OPT"
-            else:
-                classif = "CLASSIF_FCT"
+            # Pre-classify; LLM will refine
+            classif = _classify_bucket(worst_pct, avg_pct, avg_lol, worst_s, lclk, cclk)
 
             int_ext_label = f"{ie}/{iec}" if iec else (ie or "EXT")
+            pct_str = f"{worst_pct}%w" if worst_pct is not None else "N/A"
+            avg_pct_str = f"{avg_pct}%w" if avg_pct is not None else "N/A"
             desc = (f"[{int_ext_label}] {lclk}->{cclk} {sp}->{ep} "
-                    f"({cnt} paths, worst {worst_s}ps/{worst_pct}%w, avg {avg_s}ps/{avg_pct}%w, "
+                    f"({cnt} paths, worst {worst_s}ps/{pct_str}, avg {avg_s}ps/{avg_pct_str}, "
                     f"avg_lol={avg_lol})")
 
             ext_buckets.append({
@@ -899,7 +931,7 @@ def _csv_source_with_aliases(con, csv_path):
 
     aliases = [
         col_or_null("slack", "normal_slack", cast_to="DOUBLE"),
-        col_or_null("clock_percentage", cast_to="DOUBLE"),
+        col_or_null("clock_percentage", "percent_period", cast_to="DOUBLE"),
         col_or_null("period", "start_clock_period", cast_to="DOUBLE"),
         col_or_null("startpoint", "start_pin"),
         col_or_null("endpoint", "end_pin"),
@@ -914,6 +946,17 @@ def _csv_source_with_aliases(con, csv_path):
         col_or_null("levels_of_logic", "number_data_cells", cast_to="INTEGER"),
         col_or_null("path_type", "path_delay_type"),
     ]
+
+    # If clock_percentage is NULL but we have slack and period, derive it
+    has_clock_pct = any(alt in csv_cols for alt in ("clock_percentage", "percent_period"))
+    has_period = any(alt in csv_cols for alt in ("period", "start_clock_period"))
+    has_slack = any(alt in csv_cols for alt in ("slack", "normal_slack"))
+    if not has_clock_pct and has_period and has_slack:
+        # Replace the NULL clock_percentage alias with a derived formula
+        aliases = [a if not a.endswith("AS clock_percentage") else
+                   "CASE WHEN period > 0 THEN ROUND(100.0 * ABS(slack) / period, 1) ELSE NULL END AS clock_percentage"
+                   for a in aliases]
+
     return f"(SELECT {', '.join(aliases)} FROM {raw_src}) AS csv_data"
 
 
