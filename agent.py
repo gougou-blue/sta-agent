@@ -691,7 +691,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             FROM {source}
             WHERE {where}
               AND int_ext = 'EXT'
-              AND NOT (clock_percentage >= 0 AND clock_percentage < 2)
+              AND (clock_percentage IS NULL OR clock_percentage < 0 OR clock_percentage >= 2)
             GROUP BY sp_n1, ep_n1, launch_clock, capture_clock
             ORDER BY path_count DESC
         """, params)
@@ -724,8 +724,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         # ── Remaining: only INT_C2C for LLM (if leaf_depth > 1) ──
         remaining_where = (f"{where}"
             f" AND NOT ({int_exclude_cond})"
-            f" AND NOT (int_ext != 'INT' AND clock_percentage >= 0 AND clock_percentage < 2)"
-            f" AND int_ext != 'EXT'")
+            f" AND NOT (int_ext = 'EXT')"
+            f" AND NOT (clock_percentage >= 0 AND clock_percentage < 2)")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
@@ -912,18 +912,20 @@ def _csv_source_with_aliases(con, csv_path):
     csv_cols = {d[0].lower() for d in col_check.description}
     csv_types = {d[0].lower(): str(d[1]) for d in col_check.description}
 
-    def col_or_null(standard, *alternatives, cast_to=None):
+    def col_or_null(standard, *alternatives, cast_to=None, strip_pct=False):
         for alt in (standard,) + alternatives:
             if alt in csv_cols:
                 expr = f'"{alt}"'
-                if cast_to and 'VARCHAR' in csv_types.get(alt, '').upper():
-                    expr = f'TRY_CAST("{alt}" AS {cast_to})'
+                if strip_pct:
+                    expr = f"REPLACE({expr}, '%', '')"
+                if cast_to and ('VARCHAR' in csv_types.get(alt, '').upper() or strip_pct):
+                    expr = f'TRY_CAST({expr} AS {cast_to})'
                 return f'{expr} AS {standard}'
         return f"NULL AS {standard}"
 
     aliases = [
         col_or_null("slack", "normal_slack", cast_to="DOUBLE"),
-        col_or_null("clock_percentage", cast_to="DOUBLE"),
+        col_or_null("clock_percentage", cast_to="DOUBLE", strip_pct=True),
         col_or_null("period", "start_clock_period", cast_to="DOUBLE"),
         col_or_null("startpoint", "start_pin"),
         col_or_null("endpoint", "end_pin"),
