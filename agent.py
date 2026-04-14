@@ -642,7 +642,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                     "path_count": count,
                 })
 
-        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2, NOT internal) ──
+        # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
@@ -652,7 +652,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
             FROM {source}
             WHERE {where}
-              AND clock_percentage < 2
+              AND clock_percentage >= 0 AND clock_percentage < 2
               AND int_ext != 'INT'
             GROUP BY launch_clock, capture_clock, driver_partition, receiver_partition
             ORDER BY path_count DESC
@@ -681,7 +681,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         # Exclude: auto-bucketed INT (Partition_Internals) + PTECO candidates
         remaining_where = (f"{where}"
             f" AND NOT ({int_exclude_cond})"
-            f" AND NOT (int_ext != 'INT' AND clock_percentage < 2)")
+            f" AND NOT (int_ext != 'INT' AND clock_percentage >= 0 AND clock_percentage < 2)")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
