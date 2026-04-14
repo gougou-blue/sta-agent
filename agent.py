@@ -1366,6 +1366,7 @@ def main():
                 output_path = args.output or f"./buckets/{partition}_{args.mode}.bucket"
 
             # Pre-call triage_timing_run in Python (avoids LLM path typos & saves a tool round-trip)
+            global _last_exported_bucket_path
             console.print(f"\n[dim]Running triage analysis...[/dim]")
             triage_data = triage_timing_run(con, block_label, run_label, args.mode, csv_path=csv_path)
             if "error" in triage_data:
@@ -1421,16 +1422,16 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"ALL {total_failing} paths are auto-bucketed by Python ({n_auto} buckets).\n"
-                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules.\n\n"
+                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules, then call export.\n\n"
                     f"Workflow:\n"
-                    f"1. Review each item in c2c_ext_for_classification.\n"
+                    f"1. Review each item in c2c_ext_for_classification (may be empty if all paths are PO_INT/PTECO).\n"
                     f"2. Assign an IRIS classification to each bucket based on its stats:\n"
                     f"   - worst_clock_pct > 100% → CLASSIF_CONSTRAINTS\n"
                     f"   - avg_clock_pct 2-30% → CLASSIF_PO_OPT\n"
                     f"   - High avg levels_of_logic → HRP-001 → CLASSIF_FCT\n"
                     f"   - Otherwise → CLASSIF_FCT with specific IRIS rule\n"
-                    f"3. Call export_bucket_file({export_params}, buckets=[]) with an EMPTY bucket list.\n"
-                    f"   Python will export ALL auto-buckets (PO_INT + PTECO + C2C/EXT).\n"
+                    f"3. ALWAYS call export_bucket_file({export_params}, buckets=[]) — even if c2c_ext list is empty.\n"
+                    f"   Python will export ALL auto-buckets (PO_INT + PTECO + C2C/EXT). You MUST call this.\n"
                     f"4. Print triage summary: for each C2C/EXT bucket, print classification + description."
                 )
             else:
@@ -1440,16 +1441,16 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"ALL {total_failing} paths are auto-bucketed by Python ({n_auto} buckets).\n"
-                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules.\n\n"
+                    f"Your ONLY job: classify the {len(ext_for_classif)} C2C/EXT buckets with IRIS rules, then call export.\n\n"
                     f"Workflow:\n"
-                    f"1. Review each item in c2c_ext_for_classification.\n"
+                    f"1. Review each item in c2c_ext_for_classification (may be empty if all paths are PO_INT/PTECO).\n"
                     f"2. Assign IRIS classification using the waterfall (first match wins):\n"
                     f"   Stage 1 - Constraints Check → CLASSIF_CONSTRAINTS (IOC, CON rules)\n"
                     f"   Stage 2 - Feedthrough Check → CLASSIF_FCT (FTC rules)\n"
                     f"   Stage 3 - Optimization Check → CLASSIF_PO_OPT (2-30% window, by partition)\n"
                     f"   Stage 4 - Additional Check → CLASSIF_FCT (HRP, MOP, SKW rules)\n"
-                    f"3. Call export_bucket_file({export_params}, buckets=[]) with an EMPTY bucket list.\n"
-                    f"   Python exports ALL {n_auto} auto-buckets (PO_INT + PTECO + C2C/EXT + catch-all).\n"
+                    f"3. ALWAYS call export_bucket_file({export_params}, buckets=[]) — even if c2c_ext list is empty.\n"
+                    f"   Python exports ALL {n_auto} auto-buckets (PO_INT + PTECO + C2C/EXT + catch-all). You MUST call this.\n"
                     f"4. Print triage summary: C2C/EXT classifications, then PO_INT & PTECO totals."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
