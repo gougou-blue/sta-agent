@@ -540,23 +540,34 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
         total_failing = sum_rows[0][0] if sum_rows else 0
 
         # ── Auto-bucket 1: Partition internals → CLASSIF_PO_INT ──
+        # Use int_ext='INT' AND int_ext_child='INT' as the reliable indicator.
+        # Derive partition name from the common startpoint prefix (first path component before /).
+        # Never rely solely on driver_partition/receiver_partition — they may be NULL in raw CSVs.
         po_int = con.execute(f"""
             SELECT
-                driver_partition as partition,
+                COALESCE(
+                    driver_partition,
+                    CASE WHEN POSITION('/' IN startpoint) > 0
+                         THEN SUBSTRING(startpoint, 1, POSITION('/' IN startpoint) - 1)
+                         ELSE 'unknown'
+                    END
+                ) as partition,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
             FROM {source}
             WHERE {where}
-              AND driver_partition = receiver_partition
-              AND (int_ext = 'INT' OR int_ext IS NULL)
-            GROUP BY driver_partition
+              AND int_ext = 'INT'
+              AND (int_ext_child = 'INT' OR int_ext_child IS NULL)
+            GROUP BY partition
             ORDER BY path_count DESC
         """, params)
         po_int_buckets = []
         po_int_total = 0
         for row in po_int.fetchall():
             part_name, count, worst_s, worst_pct = row
+            if not part_name or part_name == 'unknown':
+                continue
             po_int_total += count
             po_int_buckets.append({
                 "priority": 90,
@@ -567,7 +578,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
                 "path_count": count,
             })
 
-        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2) ──
+        # ── Auto-bucket 2: PTECO candidates (clock_percentage < 2, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
@@ -578,7 +589,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             FROM {source}
             WHERE {where}
               AND clock_percentage < 2
-              AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))
+              AND NOT (int_ext = 'INT' AND (int_ext_child = 'INT' OR int_ext_child IS NULL))
             GROUP BY launch_clock, capture_clock, driver_partition, receiver_partition
             ORDER BY path_count DESC
         """, params)
@@ -603,9 +614,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None):
             })
 
         # ── Remaining C2C/EXT paths: summarize for LLM ──
+        # Exclude internals (int_ext='INT' AND int_ext_child='INT') and PTECO (<2% window)
         remaining_where = (f"{where}"
             f" AND clock_percentage >= 2"
-            f" AND NOT (driver_partition = receiver_partition AND (int_ext = 'INT' OR int_ext IS NULL))")
+            f" AND NOT (int_ext = 'INT' AND (int_ext_child = 'INT' OR int_ext_child IS NULL))")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
@@ -802,18 +814,19 @@ def _csv_source_with_aliases(con, csv_path):
     aliases = [
         col_or_null("slack", "normal_slack", cast_to="DOUBLE"),
         col_or_null("clock_percentage", cast_to="DOUBLE"),
-        col_or_null("period", cast_to="DOUBLE"),
-        col_or_null("startpoint"),
-        col_or_null("endpoint"),
+        col_or_null("period", "start_clock_period", cast_to="DOUBLE"),
+        col_or_null("startpoint", "start_pin"),
+        col_or_null("endpoint", "end_pin"),
         col_or_null("launch_clock", "start_clock"),
         col_or_null("capture_clock", "end_clock"),
         col_or_null("path_group"),
         col_or_null("int_ext"),
         col_or_null("int_ext_child"),
+        col_or_null("child_int_type"),
         col_or_null("driver_partition"),
         col_or_null("receiver_partition"),
-        col_or_null("levels_of_logic", cast_to="INTEGER"),
-        col_or_null("path_type"),
+        col_or_null("levels_of_logic", "number_data_cells", cast_to="INTEGER"),
+        col_or_null("path_type", "path_delay_type"),
     ]
     return f"(SELECT {', '.join(aliases)} FROM {raw_src}) AS csv_data"
 
@@ -1055,10 +1068,21 @@ def handle_tool_call(con, tool_name, tool_input):
         mode = tool_input["mode"]
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
-        # Merge auto_buckets (PO_INT + PTECO from Python) with LLM's C2C/EXT buckets
-        all_buckets = list(_auto_buckets_for_export) + llm_buckets
+        # Strip any PO_INT or PTECO buckets the LLM created — Python handles those
+        filtered_llm = []
+        stripped = 0
+        for b in llm_buckets:
+            classif = b.get("classification", "")
+            if classif in ("CLASSIF_PO_INT", "CLASSIF_PTECO"):
+                stripped += 1
+            else:
+                filtered_llm.append(b)
+        if stripped:
+            console.print(f"  [dim]Stripped {stripped} LLM-generated PO_INT/PTECO buckets (Python handles those)[/dim]")
+        # Merge: LLM C2C/EXT buckets first (higher priority), then auto-buckets at the end
+        all_buckets = filtered_llm + list(_auto_buckets_for_export)
         console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
-        console.print(f"  [dim]{len(_auto_buckets_for_export)} auto-buckets (PO_INT+PTECO) + {len(llm_buckets)} LLM buckets[/dim]\n")
+        console.print(f"  [dim]{len(filtered_llm)} LLM buckets + {len(_auto_buckets_for_export)} auto-buckets (PO_INT+PTECO)[/dim]\n")
         result = export_bucket_file(all_buckets, output_path, block, run_label, mode)
         _last_exported_bucket_path = result.get("path")
         console.print(f"  [bold green]Wrote {result['bucket_count']} buckets[/bold green] to {result['path']}")
