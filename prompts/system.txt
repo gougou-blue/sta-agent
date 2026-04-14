@@ -268,14 +268,15 @@ Group paths by these dimensions (match all simultaneously):
 
 ### Timinglite Bucket File Syntax
 ```
-<priority> <filter>&&<filter>... <CLASSIF_xxx> <TAG_xxx>
+<priority> <filter>&&<filter>... TAG_xxx CLASSIF_xxx [OWNER_xxx] [TRIAGER_xxx] [free text description]
 ```
+- All fields on ONE line. Description at end is displayed in timinglite UI.
+- `#` at line start DISABLES that bucket (do NOT use for comments).
 - Filters: `PathType:max`, `LaunchClk:<regex>`, `CaptureClk:<regex>`, `StartPin:<regex>`,
   `EndPin:<regex>`, `PercentPeriod:>-30`
 - Filters are joined with `&&` (AND logic)
 - Classifications: `CLASSIF_PARs_INT` (partition internals), `CLASSIF_CONS`, `CLASSIF_OPT`, `CLASSIF_FCT`
-- Tag: `TAG_PO`, `TAG_PTECO`, `TAG_FCT`, `TAG_CONS`, `TAG_IO_CONS`, `TAG_HIP`, `TAG_UNTRIAGED`, `TAG_FCL`
-- Comments start with `#`
+- Tags: `TAG_PO`, `TAG_PTECO`, `TAG_FCT`, `TAG_CONS`, `TAG_IO_CONS`, `TAG_HIP`, `TAG_UNTRIAGED`, `TAG_FCL`
 - `#INCLUDE <path>` imports shared bucket files
 - Column name mapping: launch_clock→LaunchClk, capture_clock→CaptureClk,
   startpoint→StartPin, endpoint→EndPin, clock_percentage→PercentPeriod, path_type→PathType

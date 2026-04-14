@@ -917,7 +917,8 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     """Write a timinglite-compatible bucket file.
 
     Format:
-      Lines:  <priority> <filter&&filter&&...> <CLASSIF_xxx> <TAG_xxx>
+      <priority> <filter&&filter&&...> TAG_xxx CLASSIF_xxx [OWNER_xxx] [free text description]
+    All fields on one line. Description at end is displayed in timinglite UI.
     """
     lines = []
 
@@ -932,12 +933,12 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         classification = bucket.get("classification", "")
         tag = bucket.get("tag", "TAG_PO")
 
-        # Write description as comment above the bucket line
-        desc = bucket.get("description", "")
-        if desc:
-            lines.append(f"# {desc}")
         filter_str = "&&".join(filters)
-        lines.append(f"{priority} {filter_str} {classification} {tag}")
+        desc = bucket.get("description", "")
+        line = f"{priority} {filter_str} {tag} {classification}"
+        if desc:
+            line += f" {desc}"
+        lines.append(line)
 
     content = "\n".join(lines) + "\n"
 
