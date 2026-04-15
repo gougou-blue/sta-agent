@@ -772,10 +772,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 crossing = sp_n1
             else:
                 crossing = f"{sp_n1}->{ep_n1}"
-            # Build pin filters: use ^prefix/.* for hierarchical pins,
-            # ^prefix$ for port-level pins (no / in name)
-            sp_filter = f"StartPin:^{sp_n1}(/.*|$)" if '/' not in sp_n1 else f"StartPin:^{sp_n1}/.*"
-            ep_filter = f"EndPin:^{ep_n1}(/.*|$)" if '/' not in ep_n1 else f"EndPin:^{ep_n1}/.*"
+            # Build pin filters: use ^prefix to match hierarchical and port-level pins
+            # Keep it simple — no parentheses or alternation (re2 compatibility)
+            sp_filter = f"StartPin:^{sp_n1}" if '/' not in sp_n1 else f"StartPin:^{sp_n1}/.*"
+            ep_filter = f"EndPin:^{ep_n1}" if '/' not in ep_n1 else f"EndPin:^{ep_n1}/.*"
             filters = [sp_filter, ep_filter]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
