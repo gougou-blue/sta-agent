@@ -558,12 +558,14 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         #   to separate same-partition (Partition_Internals) from cross-partition (INT_C2C).
 
         if leaf_depth == 1:
-            # Default: group by thru_children + clock domain. All INT_AllChildren = Partition_Internals.
+            # Default: group by thru_children. All INT_AllChildren = Partition_Internals.
+            # Partition internals: group by partition only (no clock split).
+            # INT_C2C: not possible at leaf_depth=1 (all same partition).
             int_paths = con.execute(f"""
                 SELECT
                     thru_children as sp_part,
                     thru_children as ep_part,
-                    launch_clock, capture_clock,
+                    NULL as launch_clock, NULL as capture_clock,
                     COUNT(*) as path_count,
                     ROUND(MIN(slack), 1) as worst_slack,
                     ROUND(AVG(slack), 1) as avg_slack,
@@ -572,16 +574,37 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 FROM {source}
                 WHERE {where}
                   AND child_int_type = 'INT_AllChildren'
-                GROUP BY thru_children, launch_clock, capture_clock
+                GROUP BY thru_children
                 ORDER BY path_count DESC
             """, params)
             # For remaining_where: exclude all INT_AllChildren
             int_exclude_cond = "child_int_type = 'INT_AllChildren'"
         else:
-            # Override: split INT_AllChildren by n-2 component
+            # Override: split INT_AllChildren by n-2 component.
+            # Same-leaf = Partition_Internals (group by partition only, no clock).
+            # Different-leaf = INT_C2C (keep clock grouping).
             sp_leaf = f"split_part(startpoint, '/', {leaf_depth})"
             ep_leaf = f"split_part(endpoint, '/', {leaf_depth})"
-            int_paths = con.execute(f"""
+            # First: same-leaf (Partition_Internals) — no clock grouping
+            int_same = con.execute(f"""
+                SELECT
+                    ({sp_leaf}) as sp_part,
+                    ({ep_leaf}) as ep_part,
+                    NULL as launch_clock, NULL as capture_clock,
+                    COUNT(*) as path_count,
+                    ROUND(MIN(slack), 1) as worst_slack,
+                    ROUND(AVG(slack), 1) as avg_slack,
+                    ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                    ROUND(AVG(levels_of_logic), 0) as avg_lol
+                FROM {source}
+                WHERE {where}
+                  AND child_int_type = 'INT_AllChildren'
+                  AND ({sp_leaf}) = ({ep_leaf})
+                GROUP BY sp_part, ep_part
+                ORDER BY path_count DESC
+            """, params)
+            # Second: different-leaf (INT_C2C) — keep clock grouping
+            int_c2c = con.execute(f"""
                 SELECT
                     ({sp_leaf}) as sp_part,
                     ({ep_leaf}) as ep_part,
@@ -594,44 +617,59 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 FROM {source}
                 WHERE {where}
                   AND child_int_type = 'INT_AllChildren'
+                  AND ({sp_leaf}) != ({ep_leaf})
                 GROUP BY sp_part, ep_part, launch_clock, capture_clock
                 ORDER BY path_count DESC
             """, params)
-            # For remaining_where: only exclude same-leaf INT (Partition_Internals)
-            int_exclude_cond = f"child_int_type = 'INT_AllChildren' AND ({sp_leaf}) = ({ep_leaf})"
+            # For remaining_where: exclude ALL INT_AllChildren (both same-leaf and cross-leaf handled above)
+            int_exclude_cond = "child_int_type = 'INT_AllChildren'"
 
-        po_int_buckets = []   # Partition_Internals (same leaf)
+        po_int_dict = {}      # Partition_Internals keyed by partition name (merge 1 + 1b)
         int_c2c_buckets = []  # INT_C2C (different leaf, STO owns)
         po_int_total = 0
         int_c2c_total = 0
-        for row in int_paths.fetchall():
+
+        def _merge_po_int(part_name, count, worst_s, avg_s, worst_pct, avg_lol):
+            """Merge partition internal stats into dict by partition name."""
+            if part_name in po_int_dict:
+                existing = po_int_dict[part_name]
+                total = existing["path_count"] + count
+                existing["path_count"] = total
+                existing["worst_s"] = min(existing["worst_s"], worst_s)
+                existing["avg_s"] = round((existing["avg_s"] * existing["_prev_count"] + avg_s * count) / total, 1)
+                existing["worst_pct"] = min(existing["worst_pct"], worst_pct) if worst_pct is not None else existing["worst_pct"]
+                existing["avg_lol"] = round((existing["avg_lol"] * existing["_prev_count"] + avg_lol * count) / total, 0) if avg_lol is not None else existing["avg_lol"]
+                existing["_prev_count"] = total
+            else:
+                po_int_dict[part_name] = {
+                    "path_count": count,
+                    "worst_s": worst_s,
+                    "avg_s": avg_s,
+                    "worst_pct": worst_pct,
+                    "avg_lol": avg_lol,
+                    "_prev_count": count,
+                }
+
+        # Process partition internals (same-leaf, no clock filter)
+        int_same_rows = int_same.fetchall() if leaf_depth > 1 else int_paths.fetchall()
+        for row in int_same_rows:
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
+            po_int_total += count
+            _merge_po_int(sp_part, count, worst_s, avg_s, worst_pct, avg_lol)
 
-            same_leaf = (sp_part == ep_part)
-
-            # Build filter for timinglite StartPin/EndPin.
-            # Pattern: (^|/)partition_name/ — matches at start or after /
-            # This is the standard timinglite convention for multi-level hierarchies.
-            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
-            if lclk:
-                filters.append(f"LaunchClk:{lclk}")
-            if cclk:
-                filters.append(f"CaptureClk:{cclk}")
-
-            if same_leaf:
-                po_int_total += count
-                po_int_buckets.append({
-                    "priority": 95,
-                    "filters": filters,
-                    "classification": "CLASSIF_PARs_INT",
-                    "tag": "TAG_PO",
-                    "description": f"{sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
-                    "auto": True,
-                    "path_count": count,
-                })
-            else:
+        # Process INT_C2C (different-leaf, with clock filters)
+        if leaf_depth > 1:
+            for row in int_c2c.fetchall():
+                sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+                if not sp_part:
+                    continue
+                filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
+                if lclk:
+                    filters.append(f"LaunchClk:{lclk}")
+                if cclk:
+                    filters.append(f"CaptureClk:{cclk}")
                 int_c2c_total += count
                 int_c2c_buckets.append({
                     "priority": 80,
@@ -645,8 +683,33 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
 
         # ── Auto-bucket 1b: Remaining INT paths (not INT_AllChildren) ──
         # These may have child_int_type like INT_SomeChildren or NULL.
-        # Group by driver_partition × receiver_partition × clock domain.
-        other_int = con.execute(f"""
+        # Same-partition: merge into partition internals (no clock split).
+        # Cross-partition: group by partition pair + clock domain.
+        other_int_same = con.execute(f"""
+            SELECT
+                COALESCE(driver_partition, split_part(startpoint, '/', 1)) as sp_part,
+                COALESCE(receiver_partition, split_part(endpoint, '/', 1)) as ep_part,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
+            FROM {source}
+            WHERE {where}
+              AND int_ext = 'INT'
+              AND NOT ({int_exclude_cond})
+              AND COALESCE(driver_partition, split_part(startpoint, '/', 1)) = COALESCE(receiver_partition, split_part(endpoint, '/', 1))
+            GROUP BY sp_part, ep_part
+            ORDER BY path_count DESC
+        """, params)
+        for row in other_int_same.fetchall():
+            sp_part, ep_part, count, worst_s, avg_s, worst_pct, avg_lol = row
+            if not sp_part:
+                continue
+            po_int_total += count
+            _merge_po_int(sp_part, count, worst_s, avg_s, worst_pct, avg_lol)
+
+        other_int_c2c = con.execute(f"""
             SELECT
                 COALESCE(driver_partition, split_part(startpoint, '/', 1)) as sp_part,
                 COALESCE(receiver_partition, split_part(endpoint, '/', 1)) as ep_part,
@@ -660,41 +723,42 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'INT'
               AND NOT ({int_exclude_cond})
+              AND COALESCE(driver_partition, split_part(startpoint, '/', 1)) != COALESCE(receiver_partition, split_part(endpoint, '/', 1))
             GROUP BY sp_part, ep_part, launch_clock, capture_clock
             ORDER BY path_count DESC
         """, params)
-        for row in other_int.fetchall():
+        for row in other_int_c2c.fetchall():
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
-            same_part = (sp_part == ep_part)
             filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
                 filters.append(f"CaptureClk:{cclk}")
-            if same_part:
-                po_int_total += count
-                po_int_buckets.append({
-                    "priority": 95,
-                    "filters": filters,
-                    "classification": "CLASSIF_PARs_INT",
-                    "tag": "TAG_PO",
-                    "description": f"INT {sp_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
-                    "auto": True,
-                    "path_count": count,
-                })
-            else:
-                int_c2c_total += count
-                int_c2c_buckets.append({
-                    "priority": 80,
-                    "filters": filters,
-                    "classification": "CLASSIF_FCT",
-                    "tag": "TAG_PO",
-                    "description": f"INT C2C {sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
-                    "auto": True,
-                    "path_count": count,
-                })
+            int_c2c_total += count
+            int_c2c_buckets.append({
+                "priority": 80,
+                "filters": filters,
+                "classification": "CLASSIF_FCT",
+                "tag": "TAG_PO",
+                "description": f"INT C2C {sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
+                "auto": True,
+                "path_count": count,
+            })
+
+        # Convert po_int_dict to po_int_buckets list
+        po_int_buckets = []
+        for part_name, stats in sorted(po_int_dict.items(), key=lambda x: -x[1]["path_count"]):
+            po_int_buckets.append({
+                "priority": 95,
+                "filters": [f"StartPin:(^|/){part_name}/", f"EndPin:(^|/){part_name}/"],
+                "classification": "CLASSIF_PARs_INT",
+                "tag": "TAG_PO",
+                "description": f"{part_name} partition_internals ({stats['path_count']} paths, worst {stats['worst_s']}ps, avg {stats['avg_s']}ps, avg_lol={stats['avg_lol']})",
+                "auto": True,
+                "path_count": stats["path_count"],
+            })
 
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
