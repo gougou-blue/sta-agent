@@ -191,7 +191,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "export_bucket_file",
-        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and a tag (TAG_PO/TAG_PTECO/TAG_FCT/TAG_CONS/TAG_HIP/TAG_IO_CONS/TAG_UNTRIAGED/TAG_FCL). The bucket file can be loaded directly in Timing Lite.",
+        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and an optional tag kept for internal categorization. The emitted bucket line writes the classification immediately after the filter string so the file matches known-good Timing Lite syntax.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -235,14 +235,14 @@ TOOL_SCHEMA = [
                             "tag": {
                                 "type": "string",
                                 "enum": ["TAG_PO", "TAG_PTECO", "TAG_FCT", "TAG_CONS", "TAG_IO_CONS", "TAG_HIP", "TAG_UNTRIAGED", "TAG_FCL"],
-                                "description": "Tag for the bucket category"
+                                "description": "Optional internal category tag. Not emitted into the bucket line."
                             },
                             "description": {
                                 "type": "string",
                                 "description": "Root cause analysis and recommended fix — written as # comment in bucket file so timinglite users understand why this bucket is failing"
                             }
                         },
-                        "required": ["filters", "classification", "tag"]
+                        "required": ["filters", "classification"]
                     }
                 }
             },
@@ -996,10 +996,10 @@ def _sanitize_filter_regex(filter_str):
 def export_bucket_file(buckets, output_path, block, run_label, mode):
     """Write a timinglite-compatible bucket file.
 
-    Format:
-      <priority> <filter&&filter&&...> TAG_xxx CLASSIF_xxx [OWNER_xxx] [free text description]
-    All fields on one line. Description at end is displayed in timinglite UI.
-    Section headers are written as # comments (disabled lines in timinglite).
+        Format:
+            <priority> <filter&&filter&&...> CLASSIF_xxx [OWNER_xxx] [free text description]
+        All fields on one line. Description at end is displayed in timinglite UI.
+        Section headers are written as plain text lines so Timing Lite shows them as labels.
     """
     # Define section order for grouping buckets
     SECTION_ORDER = [
@@ -1020,10 +1020,9 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         raw_filters = [f for f in raw_filters if not f.startswith("PathType:")]
         filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
         classification = bucket.get("classification", "")
-        tag = bucket.get("tag", "TAG_PO")
         filter_str = "&&".join(filters)
         desc = bucket.get("description", "")
-        line = f"{priority} {filter_str} {tag} {classification}"
+        line = f"{priority} {filter_str} {classification}"
         if desc:
             line += f" {desc}"
         return line
