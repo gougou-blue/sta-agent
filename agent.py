@@ -561,7 +561,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             # Default: group by thru_children. All INT_AllChildren = Partition_Internals.
             # Partition internals: group by partition only (no clock split).
             # INT_C2C: not possible at leaf_depth=1 (all same partition).
-            int_paths = con.execute(f"""
+            int_same_rows = con.execute(f"""
                 SELECT
                     thru_children as sp_part,
                     thru_children as ep_part,
@@ -576,7 +576,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                   AND child_int_type = 'INT_AllChildren'
                 GROUP BY thru_children
                 ORDER BY path_count DESC
-            """, params)
+            """, params).fetchall()
+            int_c2c_rows = []
             # For remaining_where: exclude all INT_AllChildren
             int_exclude_cond = "child_int_type = 'INT_AllChildren'"
         else:
@@ -586,7 +587,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_leaf = f"split_part(startpoint, '/', {leaf_depth})"
             ep_leaf = f"split_part(endpoint, '/', {leaf_depth})"
             # First: same-leaf (Partition_Internals) — no clock grouping
-            int_same = con.execute(f"""
+            # IMPORTANT: fetchall() immediately — DuckDB's con.execute() returns the
+            # connection itself, so a second execute() would overwrite the first result.
+            int_same_rows = con.execute(f"""
                 SELECT
                     ({sp_leaf}) as sp_part,
                     ({ep_leaf}) as ep_part,
@@ -602,9 +605,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                   AND ({sp_leaf}) = ({ep_leaf})
                 GROUP BY sp_part, ep_part
                 ORDER BY path_count DESC
-            """, params)
+            """, params).fetchall()
             # Second: different-leaf (INT_C2C) — keep clock grouping
-            int_c2c = con.execute(f"""
+            int_c2c_rows = con.execute(f"""
                 SELECT
                     ({sp_leaf}) as sp_part,
                     ({ep_leaf}) as ep_part,
@@ -620,7 +623,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                   AND ({sp_leaf}) != ({ep_leaf})
                 GROUP BY sp_part, ep_part, launch_clock, capture_clock
                 ORDER BY path_count DESC
-            """, params)
+            """, params).fetchall()
             # For remaining_where: exclude ALL INT_AllChildren (both same-leaf and cross-leaf handled above)
             int_exclude_cond = "child_int_type = 'INT_AllChildren'"
 
@@ -651,7 +654,6 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 }
 
         # Process partition internals (same-leaf, no clock filter)
-        int_same_rows = int_same.fetchall() if leaf_depth > 1 else int_paths.fetchall()
         for row in int_same_rows:
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
@@ -660,27 +662,26 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             _merge_po_int(sp_part, count, worst_s, avg_s, worst_pct, avg_lol)
 
         # Process INT_C2C (different-leaf, with clock filters)
-        if leaf_depth > 1:
-            for row in int_c2c.fetchall():
-                sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
-                if not sp_part:
-                    continue
-                filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
-                if lclk:
-                    filters.append(f"LaunchClk:{lclk}")
-                if cclk:
-                    filters.append(f"CaptureClk:{cclk}")
-                int_c2c_total += count
-                int_c2c_buckets.append({
-                    "priority": 80,
-                    "filters": filters,
-                    "classification": "CLASSIF_FCT",
-                    "tag": "TAG_PO",
-                    "description": f"{sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
-                    "auto": True,
-                    "path_count": count,
-                    "section": "INT C2C",
-                })
+        for row in int_c2c_rows:
+            sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            if not sp_part:
+                continue
+            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
+            if lclk:
+                filters.append(f"LaunchClk:{lclk}")
+            if cclk:
+                filters.append(f"CaptureClk:{cclk}")
+            int_c2c_total += count
+            int_c2c_buckets.append({
+                "priority": 80,
+                "filters": filters,
+                "classification": "CLASSIF_FCT",
+                "tag": "TAG_PO",
+                "description": f"{sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
+                "auto": True,
+                "path_count": count,
+                "section": "INT C2C",
+            })
 
         # ── Auto-bucket 1b: Remaining INT paths (not INT_AllChildren) ──
         # These may have child_int_type like INT_SomeChildren or NULL.
@@ -694,7 +695,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_1b = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
             ep_1b = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
 
-        other_int_same = con.execute(f"""
+        other_int_same_rows = con.execute(f"""
             SELECT
                 ({sp_1b}) as sp_part,
                 ({ep_1b}) as ep_part,
@@ -710,15 +711,15 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
               AND ({sp_1b}) = ({ep_1b})
             GROUP BY sp_part, ep_part
             ORDER BY path_count DESC
-        """, params)
-        for row in other_int_same.fetchall():
+        """, params).fetchall()
+        for row in other_int_same_rows:
             sp_part, ep_part, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
             po_int_total += count
             _merge_po_int(sp_part, count, worst_s, avg_s, worst_pct, avg_lol)
 
-        other_int_c2c = con.execute(f"""
+        other_int_c2c_rows = con.execute(f"""
             SELECT
                 ({sp_1b}) as sp_part,
                 ({ep_1b}) as ep_part,
@@ -735,8 +736,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
               AND ({sp_1b}) != ({ep_1b})
             GROUP BY sp_part, ep_part, launch_clock, capture_clock
             ORDER BY path_count DESC
-        """, params)
-        for row in other_int_c2c.fetchall():
+        """, params).fetchall()
+        for row in other_int_c2c_rows:
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
