@@ -251,7 +251,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "validate_buckets",
-        "description": "Test bucket filter coverage against actual failing paths. For each bucket, runs its regex filters as SQL against the data and counts how many paths match. Returns per-bucket match counts, total unmatched (catch-all) count and percentage, and a sample of 50 unmatched paths for pattern analysis. Use this AFTER creating buckets to verify coverage, then create additional buckets from the unmatched sample. Repeat until unmatched < 5%.",
+        "description": "Test bucket filter coverage against actual failing paths. For each bucket, runs its regex filters as SQL against the data and counts how many paths match. Returns per-bucket match counts, total unmatched path count and percentage, and a sample of 50 unmatched paths for pattern analysis. Use this AFTER creating buckets to verify coverage, then create additional buckets from the unmatched sample. Repeat until unmatched < 5%.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -930,18 +930,6 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
 
-        # Catch-all bucket for any paths not matched by specific buckets
-        catchall_buckets = [{
-            "priority": 1,
-            "filters": [],  # No filters = matches everything (PathType added at export)
-            "classification": "CLASSIF_CONS",
-            "tag": "TAG_UNTRIAGED",
-            "description": f"Catch-all: remaining unbucketed paths",
-            "auto": True,
-            "path_count": 0,
-            "section": "CATCH-ALL",
-        }]
-
         return {
             "block": block or os.path.basename(csv_path).split('.')[0],
             "run_label": run_label or csv_path,
@@ -952,7 +940,6 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
                 "int_c2c": {"buckets": int_c2c_buckets, "total_paths": int_c2c_total},
                 "ext": {"buckets": ext_buckets, "total_paths": ext_total},
-                "catchall": {"buckets": catchall_buckets, "total_paths": 0},
                 "note": "All categories are auto-bucketed by Python. INT_C2C goes to LLM only for classification refinement.",
             },
             "remaining_c2c_ext": {
@@ -1008,7 +995,6 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         "INT C2C",
         "PTECO",
         "OTHER",
-        "CATCH-ALL",
     ]
 
     path_type = "max" if mode == "setup" else "min"
@@ -1120,7 +1106,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
 
     For each bucket, builds a SQL WHERE clause from its regex filters and counts
     how many failing paths it matches. Returns per-bucket match counts and the
-    total unmatched (catch-all) count with sample unmatched paths.
+    total unmatched path count with sample unmatched paths.
     """
     try:
         if csv_path:
@@ -1203,7 +1189,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             })
             all_matched_conditions.append(f"({bucket_where})")
 
-        # Count unmatched (catch-all) paths
+        # Count unmatched paths
         if all_matched_conditions:
             any_matched = " OR ".join(all_matched_conditions)
             unmatched_where = f"{base_where} AND NOT ({any_matched})"
@@ -1395,7 +1381,7 @@ def handle_tool_call(con, tool_name, tool_input):
             pct = result["unmatched_pct"]
             status = "[bold green]PASS[/bold green]" if result["meets_target"] else "[bold red]FAIL[/bold red]"
             console.print(f"  Coverage: {matched}/{total} paths matched ({100-pct:.1f}%)")
-            console.print(f"  Catch-all: {unmatched} paths ({pct}%) — target <5% — {status}")
+            console.print(f"  Unmatched: {unmatched} paths ({pct}%) — target <5% — {status}")
         else:
             console.print(f"[red]{result['error']}[/red]")
         return json.dumps(result, default=str)
@@ -1632,14 +1618,12 @@ def main():
             console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
-            # Store ALL auto_buckets for merging at export time
-            catchall_buckets = auto.get("catchall", {}).get("buckets", [])
+            # Store exported auto-buckets for merging at export time.
             _auto_buckets_for_export.clear()
             _auto_buckets_for_export.extend(po_int_buckets)
             _auto_buckets_for_export.extend(int_c2c_buckets)
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
-            _auto_buckets_for_export.extend(catchall_buckets)
 
             # Only send remaining to LLM (all INT/EXT/PTECO are auto-bucketed)
             llm_data = {
