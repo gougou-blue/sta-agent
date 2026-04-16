@@ -611,17 +611,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
 
             same_leaf = (sp_part == ep_part)
 
-            # Build regex for timinglite StartPin/EndPin filters.
-            # For leaf_depth > 1, the partition is deeper in the path (e.g., parmccore_1
-            # is at depth 2 in mc_cluster/parmccore_1/...), so use .*<part>.* to match.
-            if leaf_depth == 1:
-                sp_regex = sp_part.replace("/", "/")
-                ep_regex = ep_part.replace("/", "/")
-                filters = [f"StartPin:^{sp_regex}/.*", f"EndPin:^{ep_regex}/.*"]
-            else:
-                sp_regex = sp_part.replace("/", "/")
-                ep_regex = ep_part.replace("/", "/")
-                filters = [f"StartPin:.*/{sp_regex}/.*", f"EndPin:.*/{ep_regex}/.*"]
+            # Build filter for timinglite StartPin/EndPin.
+            # Pattern: (^|/)partition_name/ — matches at start or after /
+            # This is the standard timinglite convention for multi-level hierarchies.
+            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
@@ -675,10 +668,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             if not sp_part:
                 continue
             same_part = (sp_part == ep_part)
-            if leaf_depth == 1:
-                filters = [f"StartPin:^{sp_part}/.*", f"EndPin:^{ep_part}/.*"]
-            else:
-                filters = [f"StartPin:.*/{sp_part}/.*", f"EndPin:.*/{ep_part}/.*"]
+            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
@@ -729,9 +719,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             desc = f"PTECO: {lclk}->{cclk} {dpart}->{rpart} ({count} paths, worst {worst_s}ps, {worst_pct}% window)"
             filters = [f"LaunchClk:{lclk}", f"CaptureClk:{cclk}"]
             if dpart:
-                filters.append(f"StartPin:^{dpart}.*")
+                filters.append(f"StartPin:(^|/){dpart}/")
             if rpart:
-                filters.append(f"EndPin:^{rpart}.*")
+                filters.append(f"EndPin:(^|/){rpart}/")
             pteco_buckets.append({
                 "priority": 50,
                 "filters": filters,
@@ -772,10 +762,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 crossing = sp_n1
             else:
                 crossing = f"{sp_n1}->{ep_n1}"
-            # Build pin filters: use ^prefix to match hierarchical and port-level pins
-            # Keep it simple — no parentheses or alternation (re2 compatibility)
-            sp_filter = f"StartPin:^{sp_n1}" if '/' not in sp_n1 else f"StartPin:^{sp_n1}/.*"
-            ep_filter = f"EndPin:^{ep_n1}" if '/' not in ep_n1 else f"EndPin:^{ep_n1}/.*"
+            # Build pin filters: (^|/)name/ pattern — standard timinglite convention
+            sp_filter = f"StartPin:(^|/){sp_n1}/"
+            ep_filter = f"EndPin:(^|/){ep_n1}/"
             filters = [sp_filter, ep_filter]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
