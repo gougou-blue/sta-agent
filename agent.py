@@ -679,16 +679,25 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                     "description": f"{sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                     "auto": True,
                     "path_count": count,
+                    "section": "INT C2C",
                 })
 
         # ── Auto-bucket 1b: Remaining INT paths (not INT_AllChildren) ──
         # These may have child_int_type like INT_SomeChildren or NULL.
         # Same-partition: merge into partition internals (no clock split).
         # Cross-partition: group by partition pair + clock domain.
+        # Use leaf_depth-aware partition extraction (n-2 for memstack, n-1 otherwise).
+        if leaf_depth > 1:
+            sp_1b = f"split_part(startpoint, '/', {leaf_depth})"
+            ep_1b = f"split_part(endpoint, '/', {leaf_depth})"
+        else:
+            sp_1b = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
+            ep_1b = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
+
         other_int_same = con.execute(f"""
             SELECT
-                COALESCE(driver_partition, split_part(startpoint, '/', 1)) as sp_part,
-                COALESCE(receiver_partition, split_part(endpoint, '/', 1)) as ep_part,
+                ({sp_1b}) as sp_part,
+                ({ep_1b}) as ep_part,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(AVG(slack), 1) as avg_slack,
@@ -698,7 +707,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'INT'
               AND NOT ({int_exclude_cond})
-              AND COALESCE(driver_partition, split_part(startpoint, '/', 1)) = COALESCE(receiver_partition, split_part(endpoint, '/', 1))
+              AND ({sp_1b}) = ({ep_1b})
             GROUP BY sp_part, ep_part
             ORDER BY path_count DESC
         """, params)
@@ -711,8 +720,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
 
         other_int_c2c = con.execute(f"""
             SELECT
-                COALESCE(driver_partition, split_part(startpoint, '/', 1)) as sp_part,
-                COALESCE(receiver_partition, split_part(endpoint, '/', 1)) as ep_part,
+                ({sp_1b}) as sp_part,
+                ({ep_1b}) as ep_part,
                 launch_clock, capture_clock,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
@@ -723,7 +732,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'INT'
               AND NOT ({int_exclude_cond})
-              AND COALESCE(driver_partition, split_part(startpoint, '/', 1)) != COALESCE(receiver_partition, split_part(endpoint, '/', 1))
+              AND ({sp_1b}) != ({ep_1b})
             GROUP BY sp_part, ep_part, launch_clock, capture_clock
             ORDER BY path_count DESC
         """, params)
@@ -745,6 +754,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "description": f"INT C2C {sp_part}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps/{worst_pct}%, avg LoL {avg_lol})",
                 "auto": True,
                 "path_count": count,
+                "section": "INT C2C",
             })
 
         # Convert po_int_dict to po_int_buckets list
@@ -758,6 +768,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "description": f"{part_name} partition_internals ({stats['path_count']} paths, worst {stats['worst_s']}ps, avg {stats['avg_s']}ps, avg_lol={stats['avg_lol']})",
                 "auto": True,
                 "path_count": stats["path_count"],
+                "section": "PARTITION INTERNALS",
             })
 
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
@@ -794,6 +805,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "description": desc,
                 "auto": True,
                 "path_count": count,
+                "section": "PTECO",
             })
 
         # ── Auto-bucket 3: EXT paths → group by n-1 partition crossing + clock domain ──
@@ -842,6 +854,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "description": f"EXT {crossing}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                 "auto": True,
                 "path_count": count,
+                "section": "EXT C2C",
             })
 
         # ── Remaining: anything not already auto-bucketed ──
@@ -916,6 +929,18 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
 
+        # Catch-all bucket for any paths not matched by specific buckets
+        catchall_buckets = [{
+            "priority": 1,
+            "filters": [],  # No filters = matches everything (PathType added at export)
+            "classification": "CLASSIF_CONS",
+            "tag": "TAG_UNTRIAGED",
+            "description": f"Catch-all: remaining unbucketed paths",
+            "auto": True,
+            "path_count": 0,
+            "section": "CATCH-ALL",
+        }]
+
         return {
             "block": block or os.path.basename(csv_path).split('.')[0],
             "run_label": run_label or csv_path,
@@ -926,6 +951,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
                 "int_c2c": {"buckets": int_c2c_buckets, "total_paths": int_c2c_total},
                 "ext": {"buckets": ext_buckets, "total_paths": ext_total},
+                "catchall": {"buckets": catchall_buckets, "total_paths": 0},
                 "note": "All categories are auto-bucketed by Python. INT_C2C goes to LLM only for classification refinement.",
             },
             "remaining_c2c_ext": {
@@ -972,12 +998,21 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     Format:
       <priority> <filter&&filter&&...> TAG_xxx CLASSIF_xxx [OWNER_xxx] [free text description]
     All fields on one line. Description at end is displayed in timinglite UI.
+    Section headers are written as # comments (disabled lines in timinglite).
     """
-    lines = []
+    # Define section order for grouping buckets
+    SECTION_ORDER = [
+        "PARTITION INTERNALS",
+        "EXT C2C",
+        "INT C2C",
+        "PTECO",
+        "OTHER",
+        "CATCH-ALL",
+    ]
 
     path_type = "max" if mode == "setup" else "min"
 
-    for bucket in buckets:
+    def _bucket_to_line(bucket):
         priority = bucket.get("priority", 1)
         raw_filters = bucket.get("filters", [])
         # Remove any PathType filters provided by Claude (we add it ourselves)
@@ -985,13 +1020,32 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
         filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
         classification = bucket.get("classification", "")
         tag = bucket.get("tag", "TAG_PO")
-
         filter_str = "&&".join(filters)
         desc = bucket.get("description", "")
         line = f"{priority} {filter_str} {tag} {classification}"
         if desc:
             line += f" {desc}"
-        lines.append(line)
+        return line
+
+    # Group buckets by section
+    from collections import OrderedDict
+    sections = OrderedDict()
+    for s in SECTION_ORDER:
+        sections[s] = []
+    for bucket in buckets:
+        section = bucket.get("section", "OTHER")
+        if section not in sections:
+            sections[section] = []
+        sections[section].append(bucket)
+
+    lines = []
+    for section_name, section_buckets in sections.items():
+        if not section_buckets:
+            continue
+        # Add section header
+        lines.append(f"# ── {section_name} ({len(section_buckets)} buckets) ──")
+        for bucket in section_buckets:
+            lines.append(_bucket_to_line(bucket))
 
     content = "\n".join(lines) + "\n"
 
@@ -1311,7 +1365,11 @@ def handle_tool_call(con, tool_name, tool_input):
                 filtered_llm.append(b)
         if stripped:
             console.print(f"  [dim]Stripped {stripped} LLM-generated auto-bucketed classifications (Python handles those)[/dim]")
-        # Merge: sort all buckets by priority descending (timinglite checks higher priority first)
+        # Tag LLM buckets with section if not already tagged
+        for b in filtered_llm:
+            if "section" not in b:
+                b["section"] = "OTHER"
+        # Merge: export groups by section, then by priority within each section
         all_buckets = filtered_llm + list(_auto_buckets_for_export)
         all_buckets.sort(key=lambda b: b.get('priority', 1), reverse=True)
         console.print(f"\n[dim]Generating bucket file: {output_path}[/dim]")
@@ -1575,11 +1633,13 @@ def main():
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
             # Store ALL auto_buckets for merging at export time
+            catchall_buckets = auto.get("catchall", {}).get("buckets", [])
             _auto_buckets_for_export.clear()
             _auto_buckets_for_export.extend(po_int_buckets)
             _auto_buckets_for_export.extend(int_c2c_buckets)
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
+            _auto_buckets_for_export.extend(catchall_buckets)
 
             # Only send remaining to LLM (all INT/EXT/PTECO are auto-bucketed)
             llm_data = {
