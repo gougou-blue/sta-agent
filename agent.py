@@ -772,11 +772,30 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "PARTITION INTERNALS",
             })
 
+        # Resolve the real partition name used in pin paths.
+        # For memstack (leaf_depth=2), this avoids using wrapper-only n-1 names like
+        # mc_cluster and instead targets the real leaf partition (parmccore_0, etc.).
+        if leaf_depth > 1:
+            sp_real_part = (
+                f"COALESCE(driver_partition, CASE "
+                f"WHEN POSITION('/' IN startpoint) = 0 THEN split_part(startpoint, '/', 1) "
+                f"ELSE split_part(startpoint, '/', {leaf_depth}) END)"
+            )
+            ep_real_part = (
+                f"COALESCE(receiver_partition, CASE "
+                f"WHEN POSITION('/' IN endpoint) = 0 THEN split_part(endpoint, '/', 1) "
+                f"ELSE split_part(endpoint, '/', {leaf_depth}) END)"
+            )
+        else:
+            sp_real_part = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
+            ep_real_part = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
+
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
-                driver_partition, receiver_partition,
+                ({sp_real_part}) as dpart,
+                ({ep_real_part}) as rpart,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
@@ -784,7 +803,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND clock_percentage >= 0 AND clock_percentage < 2
               AND int_ext != 'INT'
-            GROUP BY launch_clock, capture_clock, driver_partition, receiver_partition
+            GROUP BY launch_clock, capture_clock, dpart, rpart
             ORDER BY path_count DESC
         """, params)
         pteco_buckets = []
@@ -809,11 +828,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "PTECO",
             })
 
-        # ── Auto-bucket 3: EXT paths → group by n-1 partition crossing + clock domain ──
+        # ── Auto-bucket 3: EXT paths → group by real partition crossing + clock domain ──
         ext_paths = con.execute(f"""
             SELECT
-                split_part(startpoint, '/', 1) as sp_n1,
-                split_part(endpoint, '/', 1) as ep_n1,
+                ({sp_real_part}) as sp_part,
+                ({ep_real_part}) as ep_part,
                 launch_clock, capture_clock,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
@@ -824,24 +843,24 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'EXT'
               AND (clock_percentage IS NULL OR clock_percentage < 0 OR clock_percentage >= 2)
-            GROUP BY sp_n1, ep_n1, launch_clock, capture_clock
+            GROUP BY sp_part, ep_part, launch_clock, capture_clock
             ORDER BY path_count DESC
         """, params)
         ext_buckets = []
         ext_total = 0
         for row in ext_paths.fetchall():
-            sp_n1, ep_n1, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
-            if not sp_n1:
+            sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            if not sp_part:
                 continue
             ext_total += count
             # Determine crossing description
-            if sp_n1 == ep_n1:
-                crossing = sp_n1
+            if sp_part == ep_part:
+                crossing = sp_part
             else:
-                crossing = f"{sp_n1}->{ep_n1}"
+                crossing = f"{sp_part}->{ep_part}"
             # Build pin filters: (^|/)name/ pattern — standard timinglite convention
-            sp_filter = f"StartPin:(^|/){sp_n1}/"
-            ep_filter = f"EndPin:(^|/){ep_n1}/"
+            sp_filter = f"StartPin:(^|/){sp_part}/"
+            ep_filter = f"EndPin:(^|/){ep_part}/"
             filters = [sp_filter, ep_filter]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
@@ -858,11 +877,64 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "EXT C2C",
             })
 
-        # ── Remaining: anything not already auto-bucketed ──
-        remaining_where = (f"{where}"
+        # ── Auto-bucket 4: Top-level input-port paths in the remaining pool ──
+        # These often start from ports like fdfx_security_* and will never match
+        # partition-based StartPin filters because they are not hierarchical cell paths.
+        pre_remaining_where = (f"{where}"
             f" AND NOT (int_ext = 'INT')"
             f" AND NOT (int_ext = 'EXT')"
             f" AND NOT (clock_percentage >= 0 AND clock_percentage < 2)")
+
+        input_port_paths = con.execute(f"""
+            SELECT
+                CASE
+                    WHEN startpoint LIKE 'fdfx_security_%' THEN 'fdfx_security_*'
+                    ELSE split_part(startpoint, '/', 1)
+                END as sp_port_group,
+                ({ep_real_part}) as ep_part,
+                launch_clock, capture_clock,
+                COUNT(*) as path_count,
+                ROUND(MIN(slack), 1) as worst_slack,
+                ROUND(AVG(slack), 1) as avg_slack,
+                ROUND(AVG(levels_of_logic), 0) as avg_lol
+            FROM {source}
+            WHERE {pre_remaining_where}
+              AND POSITION('/' IN startpoint) = 0
+            GROUP BY sp_port_group, ep_part, launch_clock, capture_clock
+            ORDER BY path_count DESC
+        """, params)
+        input_port_buckets = []
+        input_port_total = 0
+        for row in input_port_paths.fetchall():
+            sp_port_group, ep_part, lclk, cclk, count, worst_s, avg_s, avg_lol = row
+            if not sp_port_group:
+                continue
+            if sp_port_group == 'fdfx_security_*':
+                sp_filter = "StartPin:^fdfx_security_.*"
+            else:
+                sp_filter = f"StartPin:^{re.escape(sp_port_group)}$"
+            filters = [sp_filter]
+            if ep_part:
+                filters.append(f"EndPin:(^|/){ep_part}/")
+            if lclk:
+                filters.append(f"LaunchClk:{lclk}")
+            if cclk:
+                filters.append(f"CaptureClk:{cclk}")
+            input_port_total += count
+            input_port_buckets.append({
+                "priority": 90,
+                "filters": filters,
+                "classification": "CLASSIF_CONS",
+                "tag": "TAG_CONS",
+                "description": f"INPUT PORTS {sp_port_group}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
+                "auto": True,
+                "path_count": count,
+                "section": "INPUT PORTS",
+            })
+
+        # ── Remaining: anything not already auto-bucketed ──
+        remaining_where = (f"{pre_remaining_where}"
+            f" AND NOT (POSITION('/' IN startpoint) = 0)")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
@@ -940,7 +1012,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
                 "int_c2c": {"buckets": int_c2c_buckets, "total_paths": int_c2c_total},
                 "ext": {"buckets": ext_buckets, "total_paths": ext_total},
-                "note": "All categories are auto-bucketed by Python. INT_C2C goes to LLM only for classification refinement.",
+                "input_ports": {"buckets": input_port_buckets, "total_paths": input_port_total},
+                "note": "INT, EXT, PTECO, and top-level input-port paths are auto-bucketed by Python. Remaining paths go to the LLM.",
             },
             "remaining_c2c_ext": {
                 "total_paths": remaining_count,
@@ -991,6 +1064,7 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     # Define section order for grouping buckets
     SECTION_ORDER = [
         "PARTITION INTERNALS",
+        "INPUT PORTS",
         "EXT C2C",
         "INT C2C",
         "PTECO",
@@ -1609,23 +1683,26 @@ def main():
             pteco_buckets = auto.get("pteco", {}).get("buckets", [])
             int_c2c_buckets = auto.get("int_c2c", {}).get("buckets", [])
             ext_buckets = auto.get("ext", {}).get("buckets", [])
+            input_port_buckets = auto.get("input_ports", {}).get("buckets", [])
             po_int_count = auto.get("po_int", {}).get("total_paths", 0)
             pteco_count = auto.get("pteco", {}).get("total_paths", 0)
             int_c2c_count = auto.get("int_c2c", {}).get("total_paths", 0)
             ext_count = auto.get("ext", {}).get("total_paths", 0)
+            input_port_count = auto.get("input_ports", {}).get("total_paths", 0)
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
-            auto_total = po_int_count + int_c2c_count + pteco_count + ext_count
-            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
+            auto_total = po_int_count + input_port_count + int_c2c_count + pteco_count + ext_count
+            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
             # Store exported auto-buckets for merging at export time.
             _auto_buckets_for_export.clear()
             _auto_buckets_for_export.extend(po_int_buckets)
+            _auto_buckets_for_export.extend(input_port_buckets)
             _auto_buckets_for_export.extend(int_c2c_buckets)
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
 
-            # Only send remaining to LLM (all INT/EXT/PTECO are auto-bucketed)
+            # Only send remaining to LLM (INT/EXT/PTECO/input-port paths are auto-bucketed)
             llm_data = {
                 "block": triage_data.get("block"),
                 "mode": triage_data.get("mode"),
@@ -1633,13 +1710,15 @@ def main():
                 "auto_bucket_summary": {
                     "partition_internals_paths": po_int_count,
                     "partition_internals_buckets": len(po_int_buckets),
+                    "input_port_paths": input_port_count,
+                    "input_port_buckets": len(input_port_buckets),
                     "int_c2c_paths": int_c2c_count,
                     "int_c2c_buckets": len(int_c2c_buckets),
                     "ext_paths": ext_count,
                     "ext_buckets": len(ext_buckets),
                     "pteco_paths": pteco_count,
                     "pteco_buckets": len(pteco_buckets),
-                    "note": "ALL INT, EXT, and PTECO paths are fully handled by Python auto-bucketing.",
+                    "note": "INT, EXT, PTECO, and top-level input-port paths are handled by Python auto-bucketing.",
                 },
                 "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
             }
@@ -1662,6 +1741,7 @@ def main():
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
+                    f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
                     f"  - {ext_count} EXT ({len(ext_buckets)} buckets)\n"
                     f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
@@ -1677,7 +1757,7 @@ def main():
                     f"5. Print summary: each bucket's category, path count, worst slack."
                 )
             else:
-                auto_count = len(po_int_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
+                auto_count = len(po_int_buckets) + len(input_port_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
                 triage_question = (
                     f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n\n"
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
@@ -1685,12 +1765,13 @@ def main():
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
+                    f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
                     f"  - {ext_count} EXT paths ({len(ext_buckets)} buckets)\n"
                     f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
                     f"Python will merge all {auto_count} auto-buckets into the export.\n\n"
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n"
-                    f"These are paths not matching INT, EXT, or PTECO categories.\n\n"
+                    f"These are paths not matching INT, EXT, PTECO, or INPUT PORTS categories.\n\n"
                     f"Workflow:\n"
                     f"1. If remaining paths exist, use remaining_c2c_ext data to create buckets.\n"
                     f"   Do NOT call query_timing_db — the data is already summarized.\n"
