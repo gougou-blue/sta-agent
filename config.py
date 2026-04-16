@@ -27,6 +27,7 @@ BLOCKS = {
     "memstack": {
         "owner": "darylkow",
         "leaf_depth": 2,  # n-2 is the real leaf partition (parmccore, parmcmisc, etc.)
+        "leaf_partitions_n1": ["pardfi"],  # some real partitions stay at n-1 instead of n-2
         "runs": [
             {
                 "label": "default_stamping",

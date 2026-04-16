@@ -535,6 +535,37 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
             params = [block, run_label, mode]
 
+        top_level_leaf_parts = set(BLOCKS.get(block, {}).get("leaf_partitions_n1", [])) if block else set()
+
+        def _partition_expr(pin_col, partition_col=None):
+            """Return SQL expression for the real partition name for a pin path.
+
+            Most memstack partitions live at n-2 (leaf_depth=2), but some partitions like
+            pardfi are real partitions at n-1 and must not be split to a deeper child.
+            """
+            top_part = f"split_part({pin_col}, '/', 1)"
+            if leaf_depth > 1:
+                if top_level_leaf_parts:
+                    top_list = ", ".join(f"'{part}'" for part in sorted(top_level_leaf_parts))
+                    base_expr = (
+                        f"CASE "
+                        f"WHEN POSITION('/' IN {pin_col}) = 0 THEN {top_part} "
+                        f"WHEN {top_part} IN ({top_list}) THEN {top_part} "
+                        f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
+                    )
+                else:
+                    base_expr = (
+                        f"CASE "
+                        f"WHEN POSITION('/' IN {pin_col}) = 0 THEN {top_part} "
+                        f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
+                    )
+            else:
+                base_expr = top_part
+
+            if partition_col:
+                return f"COALESCE({partition_col}, {base_expr})"
+            return base_expr
+
         # Overall summary
         summary = con.execute(f"""
             SELECT
@@ -584,8 +615,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             # Override: split INT_AllChildren by n-2 component.
             # Same-leaf = Partition_Internals (group by partition only, no clock).
             # Different-leaf = INT_C2C (keep clock grouping).
-            sp_leaf = f"split_part(startpoint, '/', {leaf_depth})"
-            ep_leaf = f"split_part(endpoint, '/', {leaf_depth})"
+            sp_leaf = _partition_expr("startpoint")
+            ep_leaf = _partition_expr("endpoint")
             # First: same-leaf (Partition_Internals) — no clock grouping
             # IMPORTANT: fetchall() immediately — DuckDB's con.execute() returns the
             # connection itself, so a second execute() would overwrite the first result.
@@ -689,11 +720,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         # Cross-partition: group by partition pair + clock domain.
         # Use leaf_depth-aware partition extraction (n-2 for memstack, n-1 otherwise).
         if leaf_depth > 1:
-            sp_1b = f"split_part(startpoint, '/', {leaf_depth})"
-            ep_1b = f"split_part(endpoint, '/', {leaf_depth})"
+            sp_1b = _partition_expr("startpoint")
+            ep_1b = _partition_expr("endpoint")
         else:
-            sp_1b = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
-            ep_1b = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
+            sp_1b = _partition_expr("startpoint", "driver_partition")
+            ep_1b = _partition_expr("endpoint", "receiver_partition")
 
         other_int_same_rows = con.execute(f"""
             SELECT
@@ -775,20 +806,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         # Resolve the real partition name used in pin paths.
         # For memstack (leaf_depth=2), this avoids using wrapper-only n-1 names like
         # mc_cluster and instead targets the real leaf partition (parmccore_0, etc.).
-        if leaf_depth > 1:
-            sp_real_part = (
-                f"COALESCE(driver_partition, CASE "
-                f"WHEN POSITION('/' IN startpoint) = 0 THEN split_part(startpoint, '/', 1) "
-                f"ELSE split_part(startpoint, '/', {leaf_depth}) END)"
-            )
-            ep_real_part = (
-                f"COALESCE(receiver_partition, CASE "
-                f"WHEN POSITION('/' IN endpoint) = 0 THEN split_part(endpoint, '/', 1) "
-                f"ELSE split_part(endpoint, '/', {leaf_depth}) END)"
-            )
-        else:
-            sp_real_part = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
-            ep_real_part = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
+        sp_real_part = _partition_expr("startpoint", "driver_partition")
+        ep_real_part = _partition_expr("endpoint", "receiver_partition")
 
         def _pin_filter(column_name, pin_name, is_port):
             if not pin_name:
