@@ -1043,8 +1043,8 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     for section_name, section_buckets in sections.items():
         if not section_buckets:
             continue
-        # Add section header
-        lines.append(f"# ── {section_name} ({len(section_buckets)} buckets) ──")
+        # Add section header (plain text line, no # prefix — timinglite shows it as a label)
+        lines.append(f"{section_name}")
         for bucket in section_buckets:
             lines.append(_bucket_to_line(bucket))
 
