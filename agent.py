@@ -790,12 +790,21 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_real_part = "COALESCE(driver_partition, split_part(startpoint, '/', 1))"
             ep_real_part = "COALESCE(receiver_partition, split_part(endpoint, '/', 1))"
 
+        def _pin_filter(column_name, pin_name, is_port):
+            if not pin_name:
+                return None
+            if is_port:
+                return f"{column_name}:{pin_name}"
+            return f"{column_name}:(^|/){pin_name}/"
+
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
                 ({sp_real_part}) as dpart,
                 ({ep_real_part}) as rpart,
+                (POSITION('/' IN startpoint) = 0) as d_is_port,
+                (POSITION('/' IN endpoint) = 0) as r_is_port,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
@@ -803,20 +812,22 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND clock_percentage >= 0 AND clock_percentage < 2
               AND int_ext != 'INT'
-            GROUP BY launch_clock, capture_clock, dpart, rpart
+            GROUP BY launch_clock, capture_clock, dpart, rpart, d_is_port, r_is_port
             ORDER BY path_count DESC
         """, params)
         pteco_buckets = []
         pteco_total = 0
         for row in pteco.fetchall():
-            lclk, cclk, dpart, rpart, count, worst_s, worst_pct = row
+            lclk, cclk, dpart, rpart, d_is_port, r_is_port, count, worst_s, worst_pct = row
             pteco_total += count
             desc = f"PTECO: {lclk}->{cclk} {dpart}->{rpart} ({count} paths, worst {worst_s}ps, {worst_pct}% window)"
             filters = [f"LaunchClk:{lclk}", f"CaptureClk:{cclk}"]
-            if dpart:
-                filters.append(f"StartPin:(^|/){dpart}/")
-            if rpart:
-                filters.append(f"EndPin:(^|/){rpart}/")
+            d_filter = _pin_filter("StartPin", dpart, d_is_port)
+            r_filter = _pin_filter("EndPin", rpart, r_is_port)
+            if d_filter:
+                filters.append(d_filter)
+            if r_filter:
+                filters.append(r_filter)
             pteco_buckets.append({
                 "priority": 50,
                 "filters": filters,
@@ -833,6 +844,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             SELECT
                 ({sp_real_part}) as sp_part,
                 ({ep_real_part}) as ep_part,
+                (POSITION('/' IN startpoint) = 0) as sp_is_port,
+                (POSITION('/' IN endpoint) = 0) as ep_is_port,
                 launch_clock, capture_clock,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
@@ -843,13 +856,13 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'EXT'
               AND (clock_percentage IS NULL OR clock_percentage < 0 OR clock_percentage >= 2)
-            GROUP BY sp_part, ep_part, launch_clock, capture_clock
+            GROUP BY sp_part, ep_part, sp_is_port, ep_is_port, launch_clock, capture_clock
             ORDER BY path_count DESC
         """, params)
         ext_buckets = []
         ext_total = 0
         for row in ext_paths.fetchall():
-            sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            sp_part, ep_part, sp_is_port, ep_is_port, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
             ext_total += count
@@ -858,10 +871,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 crossing = sp_part
             else:
                 crossing = f"{sp_part}->{ep_part}"
-            # Build pin filters: (^|/)name/ pattern — standard timinglite convention
-            sp_filter = f"StartPin:(^|/){sp_part}/"
-            ep_filter = f"EndPin:(^|/){ep_part}/"
-            filters = [sp_filter, ep_filter]
+            sp_filter = _pin_filter("StartPin", sp_part, sp_is_port)
+            ep_filter = _pin_filter("EndPin", ep_part, ep_is_port)
+            filters = [flt for flt in [sp_filter, ep_filter] if flt]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
@@ -891,8 +903,6 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                     WHEN startpoint LIKE 'fdfx_security_%' THEN 'fdfx_security_*'
                     ELSE split_part(startpoint, '/', 1)
                 END as sp_port_group,
-                ({ep_real_part}) as ep_part,
-                launch_clock, capture_clock,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(AVG(slack), 1) as avg_slack,
@@ -900,33 +910,27 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             FROM {source}
             WHERE {pre_remaining_where}
               AND POSITION('/' IN startpoint) = 0
-            GROUP BY sp_port_group, ep_part, launch_clock, capture_clock
+            GROUP BY sp_port_group
             ORDER BY path_count DESC
         """, params)
         input_port_buckets = []
         input_port_total = 0
         for row in input_port_paths.fetchall():
-            sp_port_group, ep_part, lclk, cclk, count, worst_s, avg_s, avg_lol = row
+            sp_port_group, count, worst_s, avg_s, avg_lol = row
             if not sp_port_group:
                 continue
             if sp_port_group == 'fdfx_security_*':
-                sp_filter = "StartPin:^fdfx_security_.*"
+                sp_filter = "StartPin:fdfx_security_.*"
             else:
-                sp_filter = f"StartPin:^{re.escape(sp_port_group)}$"
+                sp_filter = f"StartPin:{sp_port_group}"
             filters = [sp_filter]
-            if ep_part:
-                filters.append(f"EndPin:(^|/){ep_part}/")
-            if lclk:
-                filters.append(f"LaunchClk:{lclk}")
-            if cclk:
-                filters.append(f"CaptureClk:{cclk}")
             input_port_total += count
             input_port_buckets.append({
                 "priority": 90,
                 "filters": filters,
                 "classification": "CLASSIF_CONS",
                 "tag": "TAG_CONS",
-                "description": f"INPUT PORTS {sp_port_group}->{ep_part}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
+                "description": f"INPUT PORTS {sp_port_group} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                 "auto": True,
                 "path_count": count,
                 "section": "INPUT PORTS",
