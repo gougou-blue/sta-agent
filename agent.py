@@ -697,7 +697,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
-            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
+            filters = [f"StartPin:(^|/){sp_part}/.*", f"EndPin:(^|/){ep_part}/.*"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
@@ -772,7 +772,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
-            filters = [f"StartPin:(^|/){sp_part}/", f"EndPin:(^|/){ep_part}/"]
+            filters = [f"StartPin:(^|/){sp_part}/.*", f"EndPin:(^|/){ep_part}/.*"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
             if cclk:
@@ -794,7 +794,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         for part_name, stats in sorted(po_int_dict.items(), key=lambda x: -x[1]["path_count"]):
             po_int_buckets.append({
                 "priority": 95,
-                "filters": [f"StartPin:(^|/){part_name}/", f"EndPin:(^|/){part_name}/"],
+                "filters": [f"StartPin:(^|/){part_name}/.*", f"EndPin:(^|/){part_name}/.*"],
                 "classification": "CLASSIF_PARs_INT",
                 "tag": "TAG_PO",
                 "description": f"{part_name} partition_internals ({stats['path_count']} paths, worst {stats['worst_s']}ps, avg {stats['avg_s']}ps, avg_lol={stats['avg_lol']})",
@@ -814,7 +814,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 return None
             if is_port:
                 return f"{column_name}:{pin_name}"
-            return f"{column_name}:(^|/){pin_name}/"
+            return f"{column_name}:(^|/){pin_name}/.*"
 
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
