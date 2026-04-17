@@ -865,8 +865,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 ({ep_real_part}) as ep_part,
                 (POSITION('/' IN startpoint) = 0) as sp_is_port,
                 (POSITION('/' IN endpoint) = 0) as ep_is_port,
-                launch_clock, capture_clock,
                 COUNT(*) as path_count,
+                COUNT(DISTINCT COALESCE(launch_clock, '') || '->' || COALESCE(capture_clock, '')) as clock_pairs,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(AVG(slack), 1) as avg_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
@@ -875,13 +875,13 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             WHERE {where}
               AND int_ext = 'EXT'
               AND (clock_percentage IS NULL OR clock_percentage < 0 OR clock_percentage >= 2)
-            GROUP BY sp_part, ep_part, sp_is_port, ep_is_port, launch_clock, capture_clock
+            GROUP BY sp_part, ep_part, sp_is_port, ep_is_port
             ORDER BY path_count DESC
         """, params)
         ext_buckets = []
         ext_total = 0
         for row in ext_paths.fetchall():
-            sp_part, ep_part, sp_is_port, ep_is_port, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
+            sp_part, ep_part, sp_is_port, ep_is_port, count, clock_pairs, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
             ext_total += count
@@ -893,16 +893,12 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_filter = _pin_filter("StartPin", sp_part, sp_is_port)
             ep_filter = _pin_filter("EndPin", ep_part, ep_is_port)
             filters = [flt for flt in [sp_filter, ep_filter] if flt]
-            if lclk:
-                filters.append(f"LaunchClk:{lclk}")
-            if cclk:
-                filters.append(f"CaptureClk:{cclk}")
             ext_buckets.append({
                 "priority": 85,
                 "filters": filters,
                 "classification": "CLASSIF_FCT",
                 "tag": "TAG_PO",
-                "description": f"EXT {crossing}: {lclk}->{cclk} ({count} paths, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
+                "description": f"EXT {crossing} ({count} paths, {clock_pairs} clk pairs, worst {worst_s}ps, avg {avg_s}ps, avg_lol={avg_lol})",
                 "auto": True,
                 "path_count": count,
                 "section": "EXT C2C",
