@@ -549,14 +549,14 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                     top_list = ", ".join(f"'{part}'" for part in sorted(top_level_leaf_parts))
                     base_expr = (
                         f"CASE "
-                        f"WHEN POSITION('/' IN {pin_col}) = 0 THEN {top_part} "
+                        f"WHEN {pin_col} NOT LIKE '%/%' THEN {top_part} "
                         f"WHEN {top_part} IN ({top_list}) THEN {top_part} "
                         f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
                     )
                 else:
                     base_expr = (
                         f"CASE "
-                        f"WHEN POSITION('/' IN {pin_col}) = 0 THEN {top_part} "
+                        f"WHEN {pin_col} NOT LIKE '%/%' THEN {top_part} "
                         f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
                     )
             else:
@@ -822,8 +822,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 launch_clock, capture_clock,
                 ({sp_real_part}) as dpart,
                 ({ep_real_part}) as rpart,
-                (POSITION('/' IN startpoint) = 0) as d_is_port,
-                (POSITION('/' IN endpoint) = 0) as r_is_port,
+                (startpoint NOT LIKE '%/%') as d_is_port,
+                (endpoint NOT LIKE '%/%') as r_is_port,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
@@ -863,8 +863,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             SELECT
                 ({sp_real_part}) as sp_part,
                 ({ep_real_part}) as ep_part,
-                (POSITION('/' IN startpoint) = 0) as sp_is_port,
-                (POSITION('/' IN endpoint) = 0) as ep_is_port,
+                (startpoint NOT LIKE '%/%') as sp_is_port,
+                (endpoint NOT LIKE '%/%') as ep_is_port,
                 COUNT(*) as path_count,
                 COUNT(DISTINCT COALESCE(launch_clock, '') || '->' || COALESCE(capture_clock, '')) as clock_pairs,
                 ROUND(MIN(slack), 1) as worst_slack,
@@ -924,7 +924,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 ROUND(AVG(levels_of_logic), 0) as avg_lol
             FROM {source}
             WHERE {pre_remaining_where}
-              AND POSITION('/' IN startpoint) = 0
+              AND startpoint NOT LIKE '%/%'
             GROUP BY sp_port_group
             ORDER BY path_count DESC
         """, params)
@@ -953,7 +953,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
 
         # ── Remaining: anything not already auto-bucketed ──
         remaining_where = (f"{pre_remaining_where}"
-            f" AND NOT (POSITION('/' IN startpoint) = 0)")
+            f" AND NOT (startpoint NOT LIKE '%/%')")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
