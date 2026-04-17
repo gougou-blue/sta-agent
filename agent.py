@@ -48,7 +48,7 @@ SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system.
 TOOL_SCHEMA = [
     {
         "name": "query_timing_db",
-        "description": "Execute a SQL query against the timing DuckDB database (pre-ingested data). Returns results as a list of rows. Use this for blocks/runs that are in the database.",
+        "description": "Execute a SQL query against the timing DuckDB database or any temporary DuckDB view created during triage. Returns results as a list of rows. Use this for blocks/runs in the database and for triage workspaces such as triage_remaining_paths.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -164,7 +164,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "triage_timing_run",
-        "description": "Analyze all failing paths and return pre-built buckets plus summarized data for LLM classification. Returns: (1) auto_buckets — partition internals (PO_INT) and PTECO (<2% window) already bucketed, include as-is; (2) remaining_c2c_ext — C2C/EXT path groups, startpoint/endpoint prefix counts, and worst paths for you to classify into buckets. Do NOT call extra query_timing_db for drill-down — the data is pre-summarized.",
+        "description": "Analyze all failing paths and return a two-pass triage workspace. Pass 1 is Python auto-bucketing for the obvious categories. Pass 2 is LLM bucketing over the actual residual paths that do not match those auto-buckets. Returns: (1) auto_buckets — Python-generated buckets to include as-is; (2) remaining_c2c_ext — summary plus a temp-view name that the LLM should query directly for raw residual paths.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -520,19 +520,24 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
           into Partition_Internals vs INT_C2C.
 
     For large runs (100K+ paths), auto-buckets the obvious categories in Python
-    (partition internals → Partition_Internals, INT_C2C, PTECO) and returns only
-    summarized EXT data for the LLM to classify.
+    and then materializes the true residual set of paths that do not match those
+    auto-bucket filters. The LLM should inspect that residual set directly.
     """
     try:
         if csv_path:
             # Ad-hoc mode: normalize CSV column names to our standard schema
             source = _csv_source_with_aliases(con, csv_path)
             where = "slack < 0"
+            where_sql = where
             params = []
         else:
             # Ingested mode: query paths table
             source = "paths"
             where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
+            where_sql = (
+                f"block = {_sql_literal(block)} AND run_label = {_sql_literal(run_label)} "
+                f"AND mode = {_sql_literal(mode)} AND slack < 0"
+            )
             params = [block, run_label, mode]
 
         top_level_leaf_parts = set(BLOCKS.get(block, {}).get("leaf_partitions_n1", [])) if block else set()
@@ -967,12 +972,25 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "INPUT PORTS",
             })
 
-        # ── Remaining: anything not already auto-bucketed ──
-        remaining_where = (f"{pre_remaining_where}"
-            f" AND NOT ({_is_port_expr('startpoint', 'start')})")
-
+        # ── Remaining: actual paths not matched by any Python auto-bucket filter ──
+        # This is intentionally filter-accurate rather than category-accurate so the
+        # LLM sees any auto-bucket misses caused by bad regexes or over-coarse grouping.
+        all_auto_buckets = (
+            po_int_buckets
+            + input_port_buckets
+            + int_c2c_buckets
+            + pteco_buckets
+            + ext_buckets
+        )
+        remaining_where = _build_unmatched_where(where, all_auto_buckets, mode)
+        remaining_where_sql = _build_unmatched_where(where_sql, all_auto_buckets, mode)
+        remaining_view = "triage_remaining_paths"
+        con.execute(
+            f"CREATE OR REPLACE TEMP VIEW {remaining_view} AS "
+            f"SELECT * FROM {source} WHERE {remaining_where_sql}"
+        )
         remaining_count = con.execute(
-            f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
+            f"SELECT COUNT(*) FROM {remaining_view}"
         ).fetchone()[0]
 
         # Top groups by clock domain + partition crossing
@@ -987,13 +1005,12 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
                 ROUND(AVG(clock_percentage), 1) as avg_clock_pct,
                 ROUND(AVG(levels_of_logic), 0) as avg_lol
-            FROM {source}
-            WHERE {remaining_where}
+            FROM {remaining_view}
             GROUP BY launch_clock, capture_clock, int_ext, int_ext_child,
                      driver_partition, receiver_partition
             ORDER BY path_count DESC
             LIMIT 60
-        """, params)
+        """)
         rem_grp_cols = [d[0] for d in remaining_groups.description]
         rem_grp_rows = [list(r) for r in remaining_groups.fetchall()]
 
@@ -1002,12 +1019,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             SELECT
                 SUBSTRING(startpoint, 1, POSITION('/' IN startpoint || '/')) as sp_prefix,
                 COUNT(*) as cnt
-            FROM {source}
-            WHERE {remaining_where}
+            FROM {remaining_view}
             GROUP BY sp_prefix
             ORDER BY cnt DESC
             LIMIT 20
-        """, params)
+        """)
         sp_rows = [list(r) for r in sp_prefixes.fetchall()]
 
         # Top endpoint prefixes in remaining paths
@@ -1015,12 +1031,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             SELECT
                 SUBSTRING(endpoint, 1, POSITION('/' IN endpoint || '/')) as ep_prefix,
                 COUNT(*) as cnt
-            FROM {source}
-            WHERE {remaining_where}
+            FROM {remaining_view}
             GROUP BY ep_prefix
             ORDER BY cnt DESC
             LIMIT 20
-        """, params)
+        """)
         ep_rows = [list(r) for r in ep_prefixes.fetchall()]
 
         # 30 worst remaining paths for pattern analysis
@@ -1029,11 +1044,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 slack, clock_percentage, launch_clock, capture_clock,
                 int_ext, driver_partition, receiver_partition,
                 levels_of_logic, startpoint, endpoint
-            FROM {source}
-            WHERE {remaining_where}
+            FROM {remaining_view}
             ORDER BY slack ASC
             LIMIT 30
-        """, params)
+        """)
         worst_cols = [d[0] for d in worst.description]
         worst_rows = [list(r) for r in worst.fetchall()]
 
@@ -1053,11 +1067,17 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             "remaining_c2c_ext": {
                 "total_paths": remaining_count,
                 "pct_of_total": round(100 * remaining_count / total_failing, 1) if total_failing else 0,
+                "remaining_view": remaining_view,
+                "query_tool": "query_timing_db",
+                "query_examples": [
+                    f"SELECT slack, launch_clock, capture_clock, startpoint, endpoint FROM {remaining_view} ORDER BY slack ASC LIMIT 50",
+                    f"SELECT split_part(startpoint, '/', 1) AS sp_root, split_part(endpoint, '/', 1) AS ep_root, COUNT(*) AS path_count, ROUND(MIN(slack), 1) AS worst_slack FROM {remaining_view} GROUP BY sp_root, ep_root ORDER BY path_count DESC LIMIT 40",
+                ],
                 "groups": {"columns": rem_grp_cols, "rows": rem_grp_rows},
                 "startpoint_prefixes": sp_rows,
                 "endpoint_prefixes": ep_rows,
                 "worst_paths": {"columns": worst_cols, "rows": worst_rows},
-                "note": "These are INT_C2C paths. Classify using the waterfall rules.",
+                "note": "These are the actual residual failing paths after Python auto-buckets are applied. Query the remaining_view directly for pass-2 LLM bucketing.",
             },
         }
     except Exception as e:
@@ -1210,6 +1230,44 @@ def _csv_source_with_aliases(con, csv_path):
     return f"(SELECT {', '.join(aliases)} FROM {raw_src}) AS csv_data"
 
 
+def _sql_literal(value):
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _bucket_sql_conditions(bucket, mode):
+    path_type = "max" if mode == "setup" else "min"
+    raw_filters = [f for f in bucket.get("filters", []) if not f.startswith("PathType:")]
+    filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
+
+    conditions = []
+    for filt in filters:
+        if ':' not in filt:
+            continue
+        col_name, regex_val = filt.split(':', 1)
+        db_col = FILTER_COL_MAP.get(col_name, col_name)
+        if db_col == "path_type":
+            conditions.append(f"path_type = {_sql_literal(path_type)}")
+        elif db_col == "clock_percentage":
+            continue
+        else:
+            safe_regex = regex_val.replace("'", "''")
+            conditions.append(f"regexp_matches({db_col}, '{safe_regex}')")
+    return conditions
+
+
+def _build_unmatched_where(base_where, buckets, mode):
+    matched_conditions = []
+    for bucket in buckets:
+        conditions = _bucket_sql_conditions(bucket, mode)
+        if conditions:
+            matched_conditions.append(f"({' AND '.join(conditions)})")
+    if matched_conditions:
+        return f"{base_where} AND NOT ({' OR '.join(matched_conditions)})"
+    return base_where
+
+
 def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
     """Test bucket filter coverage against actual failing paths.
 
@@ -1236,30 +1294,9 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
         total_failing = total_row[0]
 
         bucket_results = []
-        all_matched_conditions = []
 
         for i, bucket in enumerate(buckets):
-            raw_filters = bucket.get("filters", [])
-            # Remove PathType from filters (we add it)
-            raw_filters = [f for f in raw_filters if not f.startswith("PathType:")]
-            filters = [f"PathType:{path_type}"] + [_sanitize_filter_regex(f) for f in raw_filters]
-
-            conditions = []
-            for filt in filters:
-                if ':' not in filt:
-                    continue
-                col_name, regex_val = filt.split(':', 1)
-                db_col = FILTER_COL_MAP.get(col_name, col_name)
-                if db_col == "path_type":
-                    conditions.append(f"path_type = '{path_type}'")
-                elif db_col == "clock_percentage":
-                    # PercentPeriod filters are numeric comparisons, not regex
-                    # Skip for now — they don't significantly affect coverage
-                    continue
-                else:
-                    # Use regexp_matches for regex filters
-                    safe_regex = regex_val.replace("'", "''")
-                    conditions.append(f"regexp_matches({db_col}, '{safe_regex}')")
+            conditions = _bucket_sql_conditions(bucket, mode)
 
             if not conditions:
                 bucket_results.append({
@@ -1296,14 +1333,9 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
                 "matched_paths": matched,
                 "pct_of_total": round(100 * matched / total_failing, 1) if total_failing else 0,
             })
-            all_matched_conditions.append(f"({bucket_where})")
 
         # Count unmatched paths
-        if all_matched_conditions:
-            any_matched = " OR ".join(all_matched_conditions)
-            unmatched_where = f"{base_where} AND NOT ({any_matched})"
-        else:
-            unmatched_where = base_where
+        unmatched_where = _build_unmatched_where(base_where, buckets, mode)
 
         unmatched_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {unmatched_where}", params
@@ -1737,7 +1769,7 @@ def main():
             _auto_buckets_for_export.extend(pteco_buckets)
             _auto_buckets_for_export.extend(ext_buckets)
 
-            # Only send remaining to LLM (INT/EXT/PTECO/input-port paths are auto-bucketed)
+            # Only send the actual residual set to the LLM after Python auto-buckets are applied.
             llm_data = {
                 "block": triage_data.get("block"),
                 "mode": triage_data.get("mode"),
@@ -1753,7 +1785,7 @@ def main():
                     "ext_buckets": len(ext_buckets),
                     "pteco_paths": pteco_count,
                     "pteco_buckets": len(pteco_buckets),
-                    "note": "INT, EXT, PTECO, and top-level input-port paths are handled by Python auto-bucketing.",
+                    "note": "Python handles the obvious first-pass buckets. Pass 2 should bucket only the residual set left after those filters are applied.",
                 },
                 "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
             }
@@ -1783,7 +1815,9 @@ def main():
                     f"Python will automatically merge them into the export.\n\n"
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n\n"
                     f"Workflow:\n"
-                    f"1. If remaining paths exist, use remaining_c2c_ext groups and worst paths to create buckets.\n"
+                    f"1. If remaining paths exist, use query_timing_db on the temp view "
+                    f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
+                    f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
                     f"2. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
                     f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
@@ -1806,10 +1840,11 @@ def main():
                     f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
                     f"Python will merge all {auto_count} auto-buckets into the export.\n\n"
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n"
-                    f"These are paths not matching INT, EXT, PTECO, or INPUT PORTS categories.\n\n"
+                    f"These are the actual failing paths left after Python auto-bucket filters are applied.\n\n"
                     f"Workflow:\n"
-                    f"1. If remaining paths exist, use remaining_c2c_ext data to create buckets.\n"
-                    f"   Do NOT call query_timing_db — the data is already summarized.\n"
+                    f"1. If remaining paths exist, use query_timing_db on the temp view "
+                    f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
+                    f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
                     f"2. Classify: HRP (high logic depth), ECO (small slack), CON (constraints).\n"
                     f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
