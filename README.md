@@ -82,11 +82,142 @@ python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bu
 The agent will:
 1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
 2. Classify using the IRIS waterfall: Constraints → Feedthrough → Optimization → Additional
-3. Validate bucket coverage — iterate until the catch-all (MSC-003) is under 5% of total failing paths
+3. Validate bucket coverage — iterate on the unmatched residual paths until unmatched is under 5% of total failing paths
 4. Generate a `.bucket` file you can load directly in Timing Lite:
    ```bash
    timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
    ```
+
+## Recommended team model
+
+Do not force one shared prompt/config for every block in the team. Different designs have different hierarchy depth, partition naming, IO conventions, and recurring failure patterns. The better model is:
+
+- Keep one shared codebase for the CLI and triage workflow.
+- Treat `--reports-dir` as the default team workflow. Ingest is optional and not required for normal design adoption.
+- Let each design owner keep a design-specific branch or clone with its own prompt tuning and, only if needed, design-specific config.
+- Only merge changes back to shared `main` when they are clearly generic and help multiple designs.
+
+## Create your own design-specific version
+
+### Path 1: zero-code adoption
+
+If a team member only wants to analyze one run or a small number of runs, they do not need to edit the repo at all.
+
+```bash
+python3 agent.py --reports-dir /path/to/my_design/.../reports/ "analyze worst setup paths"
+python3 agent.py --reports-dir /path/to/my_design/.../reports/ -i
+python3 agent.py --triage --reports-dir /path/to/my_design/.../reports/ -m setup
+```
+
+Use this path when:
+
+- The design is new and you are still learning what makes it different.
+- You do not need run-to-run comparisons or historical trends.
+- You want to test whether the prompt understands your report content before customizing anything.
+
+### Path 2: design-specific agent variant
+
+Use this when a design has stable naming conventions and repeated triage needs.
+
+Important: a design-specific branch does not have to mean hard-coding the block into the shared agent. For many teams, the branch is mainly for prompt tuning and local examples while day-to-day analysis still uses `--reports-dir`.
+
+1. Clone the repo and create a branch for the design.
+
+```bash
+git clone https://github.com/gougou-blue/sta-agent.git
+cd sta-agent
+git checkout -b my_design_agent
+```
+
+2. Only add the design to `config.py` if you want named runs, persistent shortcuts, or pre-defined hierarchy controls for that design.
+
+```python
+"my_design": {
+   "owner": "myintelid",
+   "leaf_depth": 1,
+   "leaf_partitions_n1": [],
+   "runs": [
+      {
+         "label": "26ww16.1",
+         "setup_csv": "/nfs/.../my_design.report_summary.max.csv.gz",
+         "hold_csv": "/nfs/.../my_design.report_summary.min.csv.gz",
+      },
+   ],
+},
+```
+
+3. Set the hierarchy controls for the design.
+
+- Leave `leaf_depth` at `1` if the real partitions live at the top child level.
+- Set `leaf_depth` to `2` if the real partitions are one level deeper.
+- Use `leaf_partitions_n1` for exceptions like `pardfi` where some real partitions stay at the higher level.
+
+4. Ingest is optional. Most teams can skip it unless they want trends, regression comparisons, or persistent historical queries.
+
+```bash
+python3 ingest.py --block my_design
+```
+
+5. Tune `prompts/system.txt` for design-specific language.
+
+Good prompt edits are usually small and concrete:
+
+- Common partition names or wrapper conventions.
+- Special port naming patterns.
+- Known path groups used by the design.
+- Recurring false-path or constraint-review patterns.
+- Design-specific ownership rules for STO vs PO triage.
+
+6. Test with normal Q&A first, then triage.
+
+```bash
+python3 agent.py "worst 20 setup paths in my_design 26ww16.1"
+python3 agent.py --triage -b my_design -r 26ww16.1 -m setup
+```
+
+7. Keep the variant local to the design team unless the tuning is clearly generic.
+
+## What each team should customize
+
+### Required for a serious design-specific variant
+
+- Nothing, if the team is using `--reports-dir` only.
+
+### Usually useful
+
+- `prompts/system.txt`: design vocabulary, hierarchy wording, and triage hints.
+- `README.md`: local usage examples for that design team.
+
+### Needed only when the design wants stable built-in defaults
+
+- `config.py`: block name, owner, run labels, CSV paths, hierarchy depth.
+- `prompts/system.txt`: design vocabulary and triage hints.
+
+### Usually not needed at first
+
+- `agent.py`: only change code when the design exposes a real structural difference in the data model or bucket logic.
+
+## Branch policy
+
+- `config.py` is not the only thing a design branch may change. The most common design-local changes are `prompts/system.txt`, `README.md`, and sometimes `config.py`.
+- Design-specific engineers can commit to their own branch. Committing to a private branch or design-local branch is explicitly OK.
+- What should not happen is merging design-specific prompt/config/README changes into shared `main` unless they are clearly generic.
+- If the team shares one remote, use personal or design-named branches. If the team wants stronger isolation, use a fork.
+- The safe rule is: private branch commit is OK, merge to shared `main` is not OK unless the change is a common engine improvement.
+
+## Suggested rollout for a team
+
+1. Pick one design owner and one active run.
+2. Start with `--reports-dir` and collect a few successful queries.
+3. If the agent is useful, create a design branch and tune `prompts/system.txt` for the naming patterns that matter in that design.
+4. Add `config.py` entries only if the design wants stable named runs or built-in hierarchy defaults.
+5. Only merge code changes back to the shared repo if they are generic across multiple designs.
+
+## Rule of thumb
+
+Share the engine. Do not share one frozen design personality.
+
+The CLI and validation loop can be common. The design-specific pieces should stay close to the engineers who know that block's hierarchy and failure modes.
 
 ## What it can do
 
