@@ -572,11 +572,11 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             Primary signal is path_group from the timing report:
             - INPUT_PATHS => startpoint is a block input port
             - OUTPUT_PATHS => endpoint is a block output port
-            Fall back to slash-free names only if path_group is unavailable.
+            Also treat any slash-free name as a block port.
             """
             if side == "start":
-                return f"(path_group = 'INPUT_PATHS' OR (path_group IS NULL AND {pin_col} NOT LIKE '%/%'))"
-            return f"(path_group = 'OUTPUT_PATHS' OR (path_group IS NULL AND {pin_col} NOT LIKE '%/%'))"
+                return f"(path_group = 'INPUT_PATHS' OR {pin_col} NOT LIKE '%/%')"
+            return f"(path_group = 'OUTPUT_PATHS' OR {pin_col} NOT LIKE '%/%')"
 
         # Overall summary
         summary = con.execute(f"""
@@ -829,8 +829,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             if not pin_name:
                 return None
             if pin_name not in known_partition_names:
-                return f"{column_name}:{pin_name}"
-            return f"{column_name}:(^|/){pin_name}/.*"
+                return f"{column_name}:^{re.escape(pin_name)}$"
+            return f"{column_name}:(^|/){re.escape(pin_name)}/.*"
 
         # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
@@ -951,9 +951,9 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             if not sp_port_group:
                 continue
             if sp_port_group == 'fdfx_security_*':
-                sp_filter = "StartPin:fdfx_security_.*"
+                sp_filter = "StartPin:^fdfx_security_.*$"
             else:
-                sp_filter = f"StartPin:{sp_port_group}"
+                sp_filter = f"StartPin:^{re.escape(sp_port_group)}$"
             filters = [sp_filter]
             input_port_total += count
             input_port_buckets.append({
