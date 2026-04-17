@@ -251,7 +251,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "validate_buckets",
-        "description": "Test bucket filter coverage against actual failing paths. For each bucket, runs its regex filters as SQL against the data and counts how many paths match. Returns per-bucket match counts, total unmatched path count and percentage, and a sample of 50 unmatched paths for pattern analysis. Use this AFTER creating buckets to verify coverage, then create additional buckets from the unmatched sample. Repeat until unmatched < 5%.",
+        "description": "Test bucket filter coverage against actual failing paths. During triage, Python auto-buckets are merged automatically with the LLM buckets you provide, so coverage reflects the full final bucket set. Returns per-bucket match counts, total unmatched path count and percentage, a sample of unmatched paths, and a temp view name for querying the still-unmatched residual paths. Use this after creating candidate buckets, inspect the unmatched residual, refine, and repeat before export.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1279,10 +1279,15 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
         if csv_path:
             source = _csv_source_with_aliases(con, csv_path)
             base_where = "slack < 0"
+            base_where_sql = base_where
             params = []
         else:
             source = "paths"
             base_where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
+            base_where_sql = (
+                f"block = {_sql_literal(block)} AND run_label = {_sql_literal(run_label)} "
+                f"AND mode = {_sql_literal(mode)} AND slack < 0"
+            )
             params = [block, run_label, mode]
 
         path_type = "max" if mode == "setup" else "min"
@@ -1336,9 +1341,15 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
 
         # Count unmatched paths
         unmatched_where = _build_unmatched_where(base_where, buckets, mode)
+        unmatched_where_sql = _build_unmatched_where(base_where_sql, buckets, mode)
+        unmatched_view = "triage_unmatched_paths"
+        con.execute(
+            f"CREATE OR REPLACE TEMP VIEW {unmatched_view} AS "
+            f"SELECT * FROM {source} WHERE {unmatched_where_sql}"
+        )
 
         unmatched_count = con.execute(
-            f"SELECT COUNT(*) FROM {source} WHERE {unmatched_where}", params
+            f"SELECT COUNT(*) FROM {unmatched_view}"
         ).fetchone()[0]
 
         # Sample unmatched paths for debugging
@@ -1346,11 +1357,10 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             SELECT startpoint, endpoint, launch_clock, capture_clock,
                    driver_partition, receiver_partition, int_ext, slack,
                    clock_percentage, levels_of_logic
-            FROM {source}
-            WHERE {unmatched_where}
+            FROM {unmatched_view}
             ORDER BY slack ASC
             LIMIT 30
-        """, params)
+        """)
         sample_cols = [d[0] for d in unmatched_sample.description]
         sample_rows = [list(r) for r in unmatched_sample.fetchall()]
 
@@ -1370,10 +1380,15 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             "unmatched_pct": round(100 * unmatched_count / total_failing, 1) if total_failing else 0,
             "target_pct": 5.0,
             "meets_target": (100 * unmatched_count / total_failing) < 5.0 if total_failing else True,
+            "unmatched_view": unmatched_view,
             "working_buckets": coverage_summary,
             "broken_buckets": broken_buckets,
             "unmatched_sample": {"columns": sample_cols, "rows": sample_rows},
-            "hint": "Use the unmatched_sample to create additional buckets and re-validate." if unmatched_count > 0 else "All paths covered!",
+            "query_examples": [
+                f"SELECT slack, launch_clock, capture_clock, startpoint, endpoint FROM {unmatched_view} ORDER BY slack ASC LIMIT 50",
+                f"SELECT split_part(startpoint, '/', 1) AS sp_root, split_part(endpoint, '/', 1) AS ep_root, COUNT(*) AS path_count, ROUND(MIN(slack), 1) AS worst_slack FROM {unmatched_view} GROUP BY sp_root, ep_root ORDER BY path_count DESC LIMIT 40",
+            ],
+            "hint": "Use query_timing_db on unmatched_view or the unmatched_sample to create additional buckets, then re-validate." if unmatched_count > 0 else "All paths covered!",
         }
     except Exception as e:
         return {"error": str(e)}
@@ -1509,12 +1524,15 @@ def handle_tool_call(con, tool_name, tool_input):
 
     elif tool_name == "validate_buckets":
         mode = tool_input["mode"]
-        buckets = tool_input["buckets"]
+        llm_buckets = tool_input["buckets"]
         block = tool_input.get("block")
         run_label = tool_input.get("run_label")
         csv_path = tool_input.get("csv_path")
-        console.print(f"\n[dim]Validating {len(buckets)} buckets against failing paths...[/dim]\n")
-        result = validate_buckets(con, buckets, block, run_label, mode, csv_path=csv_path)
+        all_buckets = list(llm_buckets) + list(_auto_buckets_for_export)
+        console.print(
+            f"\n[dim]Validating {len(llm_buckets)} LLM buckets + {len(_auto_buckets_for_export)} auto-buckets against failing paths...[/dim]\n"
+        )
+        result = validate_buckets(con, all_buckets, block, run_label, mode, csv_path=csv_path)
         if "error" not in result:
             matched = result["total_matched_by_buckets"]
             total = result["total_failing"]
@@ -1821,9 +1839,12 @@ def main():
                     f"2. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
                     f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"4. Call export_bucket_file({export_params}, buckets=<your remaining buckets only>).\n"
+                    f"4. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
+                    f"   Validation automatically includes Python auto-buckets.\n"
+                    f"5. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
+                    f"6. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
                     f"   If no remaining paths, pass buckets=[].\n"
-                    f"5. Print summary: each bucket's category, path count, worst slack."
+                    f"7. Print summary: each bucket's category, path count, worst slack, plus final unmatched count."
                 )
             else:
                 auto_count = len(po_int_buckets) + len(input_port_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
@@ -1848,10 +1869,13 @@ def main():
                     f"2. Classify: HRP (high logic depth), ECO (small slack), CON (constraints).\n"
                     f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"4. Call export_bucket_file({export_params}, buckets=<your remaining buckets only>).\n"
+                    f"4. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
+                    f"   Validation automatically includes Python's {auto_count} auto-buckets.\n"
+                    f"5. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
+                    f"6. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
                     f"   Python will prepend the {auto_count} auto-buckets.\n"
                     f"   If no remaining paths, pass buckets=[].\n"
-                    f"5. Print triage summary: bucket #, classification, path count, worst slack."
+                    f"7. Print triage summary: bucket #, classification, path count, worst slack, plus final unmatched count."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
