@@ -566,6 +566,18 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 return f"COALESCE({partition_col}, {base_expr})"
             return base_expr
 
+        def _is_port_expr(pin_col, side):
+            """Return SQL expression that identifies true block ports.
+
+            Primary signal is path_group from the timing report:
+            - INPUT_PATHS => startpoint is a block input port
+            - OUTPUT_PATHS => endpoint is a block output port
+            Fall back to slash-free names only if path_group is unavailable.
+            """
+            if side == "start":
+                return f"(path_group = 'INPUT_PATHS' OR (path_group IS NULL AND {pin_col} NOT LIKE '%/%'))"
+            return f"(path_group = 'OUTPUT_PATHS' OR (path_group IS NULL AND {pin_col} NOT LIKE '%/%'))"
+
         # Overall summary
         summary = con.execute(f"""
             SELECT
@@ -659,12 +671,14 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             int_exclude_cond = "child_int_type = 'INT_AllChildren'"
 
         po_int_dict = {}      # Partition_Internals keyed by partition name (merge 1 + 1b)
+        known_partition_names = set(top_level_leaf_parts)
         int_c2c_buckets = []  # INT_C2C (different leaf, STO owns)
         po_int_total = 0
         int_c2c_total = 0
 
         def _merge_po_int(part_name, count, worst_s, avg_s, worst_pct, avg_lol):
             """Merge partition internal stats into dict by partition name."""
+            known_partition_names.add(part_name)
             if part_name in po_int_dict:
                 existing = po_int_dict[part_name]
                 total = existing["path_count"] + count
@@ -697,6 +711,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
+            known_partition_names.update(p for p in (sp_part, ep_part) if p)
             filters = [f"StartPin:(^|/){sp_part}/.*", f"EndPin:(^|/){ep_part}/.*"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
@@ -772,6 +787,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             sp_part, ep_part, lclk, cclk, count, worst_s, avg_s, worst_pct, avg_lol = row
             if not sp_part:
                 continue
+            known_partition_names.update(p for p in (sp_part, ep_part) if p)
             filters = [f"StartPin:(^|/){sp_part}/.*", f"EndPin:(^|/){ep_part}/.*"]
             if lclk:
                 filters.append(f"LaunchClk:{lclk}")
@@ -812,7 +828,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         def _pin_filter(column_name, pin_name, is_port):
             if not pin_name:
                 return None
-            if is_port:
+            if pin_name not in known_partition_names:
                 return f"{column_name}:{pin_name}"
             return f"{column_name}:(^|/){pin_name}/.*"
 
@@ -822,8 +838,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 launch_clock, capture_clock,
                 ({sp_real_part}) as dpart,
                 ({ep_real_part}) as rpart,
-                (startpoint NOT LIKE '%/%') as d_is_port,
-                (endpoint NOT LIKE '%/%') as r_is_port,
+                {_is_port_expr('startpoint', 'start')} as d_is_port,
+                {_is_port_expr('endpoint', 'end')} as r_is_port,
                 COUNT(*) as path_count,
                 ROUND(MIN(slack), 1) as worst_slack,
                 ROUND(MIN(clock_percentage), 1) as worst_clock_pct
@@ -863,8 +879,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             SELECT
                 ({sp_real_part}) as sp_part,
                 ({ep_real_part}) as ep_part,
-                (startpoint NOT LIKE '%/%') as sp_is_port,
-                (endpoint NOT LIKE '%/%') as ep_is_port,
+                {_is_port_expr('startpoint', 'start')} as sp_is_port,
+                {_is_port_expr('endpoint', 'end')} as ep_is_port,
                 COUNT(*) as path_count,
                 COUNT(DISTINCT COALESCE(launch_clock, '') || '->' || COALESCE(capture_clock, '')) as clock_pairs,
                 ROUND(MIN(slack), 1) as worst_slack,
@@ -924,7 +940,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 ROUND(AVG(levels_of_logic), 0) as avg_lol
             FROM {source}
             WHERE {pre_remaining_where}
-              AND startpoint NOT LIKE '%/%'
+              AND {_is_port_expr('startpoint', 'start')}
             GROUP BY sp_port_group
             ORDER BY path_count DESC
         """, params)
@@ -953,7 +969,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
 
         # ── Remaining: anything not already auto-bucketed ──
         remaining_where = (f"{pre_remaining_where}"
-            f" AND NOT (startpoint NOT LIKE '%/%')")
+            f" AND NOT ({_is_port_expr('startpoint', 'start')})")
 
         remaining_count = con.execute(
             f"SELECT COUNT(*) FROM {source} WHERE {remaining_where}", params
