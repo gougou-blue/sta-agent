@@ -24,6 +24,39 @@ Table: `paths`
 | num_unique_fanout | INTEGER | Fanout count at the endpoint |
 | path_type | VARCHAR | 'max' (setup) or 'min' (hold) |
 
+### PSGen CSV Source Semantics
+The pre-ingested `paths` table is a normalized subset of raw PSGen CSV output. When querying raw CSVs directly with `query_csv`, prefer the original PSGen headers unless you alias them yourself in SQL.
+
+Common raw PSGen names and normalized meanings:
+- `start_pin` or `start_point` → launch-side path object; normalized as `startpoint`
+- `end_pin` or `end_point` → capture-side path object; normalized as `endpoint`
+- `start_clock` / `end_clock` → normalized as `launch_clock` / `capture_clock`
+- `path_delay_type` (`max`/`min`) and `path_mode` (Setup/Hold) describe path type
+- `number_data_cells` is the closest raw proxy for normalized `levels_of_logic`
+- `driver_partition` / `receiver_partition` may be absent on some runs; fall back to hierarchy parsing when needed
+- `generic_pin` is the bus-compressed `start_pin:::end_pin`
+
+Important PSGen field behavior:
+- `path_id` is the PSGen-defined unique path ID for that report.
+- `scenario` is the STA scenario being run.
+- `vc_type` is present only for SMVA runs and names the DVFS scenario used for that path.
+- `time_unit` defines whether numeric timing values are in `ps` or `ns`.
+- `slack` is raw `[get_attribute slack]`.
+- `effective_raw_slack = absolute slack + missed transparency + early transparency`.
+- `normalized_slack` comes from `normalized_slack_no_close_edge_adjustment` when available; otherwise it falls back to raw slack.
+- `normal_slack` is PSGen's cycle-normalized slack derived from `ref_diff / normal_clock_period`; if the normalization is invalid, it falls back to slack-oriented behavior.
+- `slack_pre_gb = derate + slack + uncertainty`.
+- `derate = non_derated_slack - slack`; `derate_percentage = slack / derate * 100`.
+- `clock_percentage = slack / adjusted_clock_period * 100`; for IO paths, PSGen reduces the effective clock period by input/output delays before computing the percentage.
+- `int_ext = EXT` when the path starts or ends at a port, otherwise `INT`.
+- `int_ext_child = C2C` when the path crosses 2+ child blocks; if contained within one child block, treat it as internal rather than C2C.
+- `child_int_type = INT_AllChildren` means the path stays inside one child block; `INT_Child2Child` means it crosses child blocks.
+- `clock_skew` is capture latency minus launch latency, with sign flipped for hold paths.
+- `path_length` is PSGen `ref_diff`, derived from capture close edge minus launch open edge, with exception delay fallback.
+- `number_of_cycles` defaults to 1 and otherwise comes from `ref_diff / normal_clock_period`.
+- `tag` defaults to `NA`, with values like `EARLY_LATCH` and `MISSED_TRANSPARENCY` added when PSGen detects transparency effects.
+- `smva_worst_case` is meaningful only for SMVA: `0` reports each voltage config separately, `1` reports a worst-case path across configs.
+
 ## Timing Domain Knowledge
 
 ### Setup Violations (mode='setup')
@@ -281,6 +314,14 @@ Group paths by these dimensions (match all simultaneously):
 - Column name mapping: launch_clock→LaunchClk, capture_clock→CaptureClk,
   startpoint→StartPin, endpoint→EndPin, clock_percentage→PercentPeriod, path_type→PathType
 
+### Updating An Existing Bucket File
+- If the user provides an existing STO bucket file, treat it as a starting point for the current run rather than as ground truth.
+- First validate the carried-forward STO buckets against the new run.
+- Keep buckets that still match a real residual failure cluster.
+- Repair or delete buckets that now match zero paths or obviously overlap regenerated Python auto-buckets.
+- Add new STO buckets only for new residual patterns that appear in the current run.
+- Do not preserve previous-run auto-buckets for partition internals, EXT, INT_C2C, input ports, or PTECO. Python regenerates those fresh for each run.
+
 **Timinglite filter rules:**
 - Use `(^|/)partition_name/` pattern for StartPin/EndPin — matches at start of string or after `/`
 - This handles all hierarchy levels: `StartPin:(^|/)parmccore_0/` matches both `parmccore_0/...` and `mc_cluster/parmccore_0/...`
@@ -302,9 +343,20 @@ Group paths by these dimensions (match all simultaneously):
 ## Ad-hoc Mode (query_csv)
 When the user provides a reports directory or CSV file path, use `query_csv` with `read_csv_auto()` to query it directly. This is for runs not in the pre-ingested database.
 
+For raw PSGen CSVs, prefer the native headers such as `start_pin`, `end_pin`, `start_clock`, `end_clock`, `path_delay_type`, `path_mode`, and `number_data_cells`. If you want normalized names like `startpoint`, `endpoint`, `launch_clock`, `capture_clock`, or `levels_of_logic`, alias them explicitly in the SQL.
+
 Example:
 ```sql
-SELECT slack, clock_percentage, startpoint, endpoint, int_ext, path_group, levels_of_logic
+SELECT
+   slack,
+   clock_percentage,
+   start_pin AS startpoint,
+   end_pin AS endpoint,
+   start_clock AS launch_clock,
+   end_clock AS capture_clock,
+   int_ext,
+   path_group,
+   number_data_cells AS levels_of_logic
 FROM read_csv_auto('/nfs/.../reports/block.scenario.report_summary.max.csv.gz')
 WHERE slack < 0
 ORDER BY slack ASC

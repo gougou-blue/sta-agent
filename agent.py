@@ -45,6 +45,19 @@ DIRECT_MODEL = "claude-sonnet-4-20250514"
 
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "system.txt")
 
+LEGACY_BUCKET_CLASSIFICATIONS = {
+    "CLASSIF_CONSTRAINTS": "CLASSIF_CONS",
+    "CLASSIF_CONS": "CLASSIF_CONS",
+    "CLASSIF_PTECO": "CLASSIF_OPT",
+    "CLASSIF_PO_OPT": "CLASSIF_OPT",
+    "CLASSIF_OPT": "CLASSIF_OPT",
+    "CLASSIF_FCT": "CLASSIF_FCT",
+    "CLASSIF_PO_INT": "CLASSIF_PARs_INT",
+    "CLASSIF_PARS_INT": "CLASSIF_PARs_INT",
+    "CLASSIF_PARs_INT": "CLASSIF_PARs_INT",
+    "Partition_Internals": "CLASSIF_PARs_INT",
+}
+
 TOOL_SCHEMA = [
     {
         "name": "query_timing_db",
@@ -66,7 +79,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "query_csv",
-        "description": "Execute a SQL query against a CSV.gz file directly from NFS using DuckDB's read_csv_auto. No ingest needed. Use for ad-hoc analysis of any timing CSV on disk. Example: SELECT slack, clock_percentage, startpoint, endpoint FROM read_csv_auto('/path/to/report_summary.max.csv.gz') WHERE slack < 0 ORDER BY slack LIMIT 20",
+        "description": "Execute a SQL query against a CSV.gz file directly from NFS using DuckDB's read_csv_auto. No ingest needed. Use for ad-hoc analysis of any timing CSV on disk. Raw PSGen CSVs usually expose headers like start_pin/end_pin/start_clock/end_clock/path_delay_type rather than normalized names like startpoint/endpoint/launch_clock/capture_clock/path_type, so alias columns in SQL when needed. Example: SELECT slack, clock_percentage, start_pin AS startpoint, end_pin AS endpoint FROM read_csv_auto('/path/to/report_summary.max.csv.gz') WHERE slack < 0 ORDER BY slack LIMIT 20",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -329,6 +342,62 @@ def load_system_prompt(reports_dir=None):
                     context += f"- `{os.path.join(reports_dir, c)}`\n"
 
     return prompt + context
+
+
+def _normalize_bucket_classification(classification):
+    """Map older bucket class names to the current export schema."""
+    normalized = (classification or "").strip()
+    return LEGACY_BUCKET_CLASSIFICATIONS.get(normalized, normalized)
+
+
+def load_existing_bucket_file(bucket_path):
+    """Parse active timinglite bucket lines into validate/export bucket dicts."""
+    if not os.path.isfile(bucket_path):
+        raise FileNotFoundError(f"Bucket file not found: {bucket_path}")
+
+    buckets = []
+    skipped_lines = []
+    with open(bucket_path, "r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#INCLUDE"):
+                skipped_lines.append({"line": line_number, "reason": "include_not_loaded"})
+                continue
+            if line.startswith("#"):
+                continue
+
+            match = re.match(
+                r"^(?P<priority>\d+)\s+(?P<filters>\S+)\s+(?P<classification>CLASSIF_[A-Za-z_]+|Partition_Internals)\s*(?P<rest>.*)$",
+                line,
+            )
+            if not match:
+                skipped_lines.append({"line": line_number, "reason": "unparsed"})
+                continue
+
+            rest = match.group("rest").strip()
+            rest_tokens = rest.split()
+            while rest_tokens and rest_tokens[0].startswith(("OWNER_", "TRIAGER_", "TAG_")):
+                rest_tokens.pop(0)
+
+            buckets.append({
+                "priority": int(match.group("priority")),
+                "filters": [f for f in match.group("filters").split("&&") if f],
+                "classification": _normalize_bucket_classification(match.group("classification")),
+                "description": " ".join(rest_tokens),
+            })
+
+    if not buckets:
+        raise ValueError(f"No active bucket definitions found in {bucket_path}")
+
+    return {
+        "path": os.path.abspath(bucket_path),
+        "bucket_count": len(buckets),
+        "skipped_line_count": len(skipped_lines),
+        "skipped_lines": skipped_lines[:10],
+        "buckets": buckets,
+    }
 
 
 def execute_query(con, sql):
@@ -972,6 +1041,10 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "INPUT PORTS",
             })
 
+        _enrich_bucket_descriptions(con, source, where, params, po_int_buckets, mode)
+        _enrich_bucket_descriptions(con, source, where, params, int_c2c_buckets, mode)
+        _enrich_bucket_descriptions(con, source, where, params, ext_buckets, mode)
+
         # ── Remaining: actual paths not matched by any Python auto-bucket filter ──
         # This is intentionally filter-accurate rather than category-accurate so the
         # LLM sees any auto-bucket misses caused by bad regexes or over-coarse grouping.
@@ -1234,6 +1307,125 @@ def _sql_literal(value):
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _bucket_has_filter(bucket, prefix):
+    return any(str(filt).startswith(prefix) for filt in bucket.get("filters", []))
+
+
+def _format_bucket_mix(rows, total):
+    parts = []
+    for label, count in rows:
+        if not label or not count:
+            continue
+        pct = round((count * 100.0) / total)
+        parts.append(f"{label} {pct}%")
+    return ", ".join(parts)
+
+
+def _bucket_hint(summary):
+    total = summary["total"]
+    if not total:
+        return ""
+
+    notes = []
+    deep_ratio = summary["deep_logic"] / total
+    shallow_ratio = summary["shallow_logic"] / total
+    worst_pct = summary["worst_clock_pct"]
+
+    if summary["feedthrough"] / total >= 0.5:
+        notes.append("feedthrough-heavy")
+    elif summary["input_paths"] / total >= 0.8:
+        notes.append("mostly input-driven")
+    elif summary["output_paths"] / total >= 0.8:
+        notes.append("mostly output-driven")
+
+    if deep_ratio >= 0.5:
+        notes.append("deep-logic dominated")
+    elif shallow_ratio >= 0.5:
+        if worst_pct is not None and worst_pct <= -50:
+            notes.append("shallow but severe")
+        else:
+            notes.append("shallow-logic dominated")
+
+    if summary["path_group_count"] and summary["path_group_count"] > 3:
+        notes.append(f"mixed {summary['path_group_count']} path groups")
+
+    return ", ".join(notes)
+
+
+def _enrich_bucket_descriptions(con, source, base_where, params, buckets, mode):
+    """Append lightweight per-bucket insight derived from the matched paths."""
+    for bucket in buckets:
+        conditions = _bucket_sql_conditions(bucket, mode)
+        if not conditions:
+            continue
+
+        full_where = f"{base_where} AND {' AND '.join(conditions)}"
+        summary_row = con.execute(f"""
+            SELECT
+                COUNT(*) as total_paths,
+                COUNT(DISTINCT COALESCE(path_group, '')) as path_group_count,
+                COUNT(DISTINCT COALESCE(launch_clock, '') || '->' || COALESCE(capture_clock, '')) as clock_pair_count,
+                SUM(CASE WHEN levels_of_logic >= 25 THEN 1 ELSE 0 END) as deep_logic_paths,
+                SUM(CASE WHEN levels_of_logic <= 5 THEN 1 ELSE 0 END) as shallow_logic_paths,
+                SUM(CASE WHEN path_group = 'INPUT_PATHS' THEN 1 ELSE 0 END) as input_paths,
+                SUM(CASE WHEN path_group = 'OUTPUT_PATHS' THEN 1 ELSE 0 END) as output_paths,
+                SUM(CASE WHEN path_group = 'FEED_THROUGH' THEN 1 ELSE 0 END) as feedthrough_paths,
+                ROUND(MIN(clock_percentage), 1) as worst_clock_pct
+            FROM {source}
+            WHERE {full_where}
+        """, params).fetchone()
+
+        if not summary_row or not summary_row[0]:
+            continue
+
+        summary = {
+            "total": summary_row[0],
+            "path_group_count": summary_row[1] or 0,
+            "clock_pair_count": summary_row[2] or 0,
+            "deep_logic": summary_row[3] or 0,
+            "shallow_logic": summary_row[4] or 0,
+            "input_paths": summary_row[5] or 0,
+            "output_paths": summary_row[6] or 0,
+            "feedthrough": summary_row[7] or 0,
+            "worst_clock_pct": summary_row[8],
+        }
+
+        top_groups = con.execute(f"""
+            SELECT COALESCE(path_group, 'NA') as path_group, COUNT(*) as path_count
+            FROM {source}
+            WHERE {full_where}
+            GROUP BY path_group
+            ORDER BY path_count DESC, path_group
+            LIMIT 2
+        """, params).fetchall()
+
+        additions = []
+        group_mix = _format_bucket_mix(top_groups, summary["total"])
+        if group_mix:
+            additions.append(f"groups={group_mix}")
+
+        if not (_bucket_has_filter(bucket, "LaunchClk:") and _bucket_has_filter(bucket, "CaptureClk:")):
+            top_clocks = con.execute(f"""
+                SELECT COALESCE(launch_clock, 'NA') || '->' || COALESCE(capture_clock, 'NA') as clock_pair,
+                       COUNT(*) as path_count
+                FROM {source}
+                WHERE {full_where}
+                GROUP BY clock_pair
+                ORDER BY path_count DESC, clock_pair
+                LIMIT 2
+            """, params).fetchall()
+            clock_mix = _format_bucket_mix(top_clocks, summary["total"])
+            if clock_mix and summary["clock_pair_count"] > 1:
+                additions.append(f"clock_mix={clock_mix}")
+
+        hint = _bucket_hint(summary)
+        if hint:
+            additions.append(f"hint={hint}")
+
+        if additions:
+            bucket["description"] = f"{bucket['description']}; " + "; ".join(additions)
 
 
 def _bucket_sql_conditions(bucket, mode):
@@ -1659,6 +1851,7 @@ def main():
                "  python agent.py 'top 10 worst setup paths in d2d1'\n"
                "  python agent.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
                "  python agent.py --triage -b d2d1 -r 26ww14.3 -m setup\n"
+             "  python agent.py --triage --reports-dir /path/to/reports -m setup --existing-bucket ./buckets/d2d1_setup.bucket\n"
                "  python agent.py -i\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1674,6 +1867,7 @@ def main():
                         help="Triage persona: 'sto' (Section Timing Owner, focuses on C2C/EXT, default) or 'po' (Partition Owner, focuses on partition internals)")
     parser.add_argument("--partition", "-p", help="Partition name for PO mode (e.g., pard2d1uladda1). Required when --persona po")
     parser.add_argument("--output", "-o", help="Output path for bucket file (default: ./buckets/<block>_<run>_<mode>.bucket)")
+    parser.add_argument("--existing-bucket", help="Seed triage with an existing timinglite bucket file and update it for the current run")
     parser.add_argument("--db", default=DB_PATH, help=f"DuckDB path (default: {DB_PATH})")
     args = parser.parse_args()
 
@@ -1715,6 +1909,10 @@ def main():
         console.print("[dim]Using direct Anthropic API[/dim]")
 
     try:
+        if args.existing_bucket and not args.triage:
+            console.print("[red]--existing-bucket is only supported with --triage[/red]")
+            sys.exit(1)
+
         if args.triage:
             if not args.mode:
                 console.print("[red]--triage requires --mode (setup or hold)[/red]")
@@ -1745,12 +1943,27 @@ def main():
             persona = args.persona or 'sto'
             partition = args.partition
             output_path = args.output or f"./buckets/{block_label}_{args.mode}.bucket"
+            existing_bucket_data = None
 
             if persona == 'po':
                 if not partition:
                     console.print("[red]--persona po requires --partition <partition_name>[/red]")
                     sys.exit(1)
                 output_path = args.output or f"./buckets/{partition}_{args.mode}.bucket"
+
+            if args.existing_bucket:
+                try:
+                    existing_bucket_data = load_existing_bucket_file(args.existing_bucket)
+                except (FileNotFoundError, ValueError) as exc:
+                    console.print(f"[red]{exc}[/red]")
+                    sys.exit(1)
+                console.print(
+                    f"  Loaded {existing_bucket_data['bucket_count']} existing buckets from {existing_bucket_data['path']}"
+                )
+                if existing_bucket_data["skipped_line_count"]:
+                    console.print(
+                        f"  [dim]Skipped {existing_bucket_data['skipped_line_count']} non-bucket lines while parsing the seed file[/dim]"
+                    )
 
             # Pre-call triage_timing_run in Python (avoids LLM path typos & saves a tool round-trip)
             console.print(f"\n[dim]Running triage analysis...[/dim]")
@@ -1817,6 +2030,23 @@ def main():
             else:
                 validate_params += f", block='{block_label}', run_label='{run_label}'"
 
+            existing_bucket_prompt = ""
+            if existing_bucket_data:
+                existing_bucket_json = json.dumps(existing_bucket_data, default=str)
+                existing_bucket_prompt = (
+                    f"\nYou are updating an existing bucket file instead of starting from scratch.\n"
+                    f"Seed bucket file: {existing_bucket_data['path']}\n"
+                    f"Parsed seed buckets (already converted to current classification names when needed):\n"
+                    f"{existing_bucket_json}\n\n"
+                    f"Update rules:\n"
+                    f"- Start from these seed buckets for your first validation pass.\n"
+                    f"- Keep buckets that still match the new run and still represent a distinct STO-owned root cause.\n"
+                    f"- Repair or retarget buckets that now have 0 matches or overly broad matches.\n"
+                    f"- Remove stale buckets that no longer apply.\n"
+                    f"- Add new buckets for any new residual failing-path patterns in this run.\n"
+                    f"- Do NOT carry forward prior auto-buckets for partition internals, EXT, INT_C2C, input ports, or PTECO; Python has already regenerated those for this run.\n"
+                )
+
             if persona == 'po':
                 triage_question = (
                     f"Triage all failing {args.mode} paths in partition '{partition}' "
@@ -1832,6 +2062,7 @@ def main():
                     f"  - {pteco_count} PTECO ({len(pteco_buckets)} buckets)\n"
                     f"Python will automatically merge them into the export.\n\n"
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n\n"
+                    f"{existing_bucket_prompt}"
                     f"Workflow:\n"
                     f"1. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
@@ -1862,6 +2093,7 @@ def main():
                     f"Python will merge all {auto_count} auto-buckets into the export.\n\n"
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n"
                     f"These are the actual failing paths left after Python auto-bucket filters are applied.\n\n"
+                    f"{existing_bucket_prompt}"
                     f"Workflow:\n"
                     f"1. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "

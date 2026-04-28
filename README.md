@@ -71,6 +71,9 @@ python3 agent.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m 
 
 # Specify output path
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
+
+# Update an existing STO bucket file for a new run
+python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --existing-bucket ./buckets/d2d1_setup.bucket -o ./buckets/d2d1_setup_updated.bucket
 ```
 
 **Persona modes:**
@@ -87,6 +90,8 @@ The agent will:
    ```bash
    timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
    ```
+
+If you pass `--existing-bucket`, the agent parses the active bucket lines from that file and uses them as the starting STO bucket set for the new run. It keeps buckets that still match, fixes or drops stale ones, and adds new residual buckets as needed. Python still regenerates the auto-buckets for partition internals, EXT, INT_C2C, input ports, and PTECO for the current run.
 
 ## Recommended team model
 
@@ -236,6 +241,8 @@ config.py           — Block/run configuration (for pre-ingested data)
 ingest.py           — Parse sta_pt CSV.gz → DuckDB (optional)
 prompts/system.txt  — STA domain knowledge and analysis guidelines
 ```
+
+Raw ad-hoc `query_csv` access sees PSGen's original CSV headers. The pre-ingested DuckDB `paths` table uses normalized names like `startpoint`, `endpoint`, `launch_clock`, and `capture_clock`, but direct CSV queries often need PSGen names such as `start_pin`, `end_pin`, `start_clock`, `end_clock`, and `path_delay_type` unless you alias them in SQL.
 
 ## Token refresh
 

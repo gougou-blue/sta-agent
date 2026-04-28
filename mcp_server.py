@@ -73,9 +73,13 @@ def query_csv(sql: str, explanation: str = "") -> str:
     """Execute a SQL query against a CSV.gz file on NFS using DuckDB read_csv_auto.
 
     No ingest needed — reads CSV files directly. Example:
-    SELECT slack, startpoint, endpoint
+    SELECT slack, start_pin AS startpoint, end_pin AS endpoint
     FROM read_csv_auto('/nfs/.../report_summary.max.csv.gz')
     WHERE slack < 0 ORDER BY slack LIMIT 20
+
+    Raw PSGen CSVs typically use native names like start_pin/end_pin/start_clock/end_clock/
+    path_delay_type. Alias them in SQL if you want normalized names such as startpoint,
+    endpoint, launch_clock, capture_clock, or path_type.
 
     Args:
         sql: SQL using read_csv_auto('/path/to/file.csv.gz').
