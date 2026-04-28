@@ -151,6 +151,8 @@ The number of buckets is not fixed — it is determined by how many distinct gro
 
 ### Owner Classification (from auto-triage rules)
 Assign each bucket a classification AND a tag. Valid classifications:
+- **CLASSIF_WAIVE0P5**: Setup paths failing by less than 20% of cycle time during the 0p5 milestone.
+   Auto-assigned by Python as `PercentPeriod:>-20`. These paths are intentionally waived from deeper triage for the current milestone.
 - **CLASSIF_PARs_INT**: Partition-internal paths (INT, same partition). PO-owned, not triaged by STO.
   Auto-assigned by Python — do NOT use this in LLM-created buckets.
   Tag: TAG_PO

@@ -52,6 +52,7 @@ LEGACY_BUCKET_CLASSIFICATIONS = {
     "CLASSIF_PO_OPT": "CLASSIF_OPT",
     "CLASSIF_OPT": "CLASSIF_OPT",
     "CLASSIF_FCT": "CLASSIF_FCT",
+    "CLASSIF_WAIVE0P5": "CLASSIF_WAIVE0P5",
     "CLASSIF_PO_INT": "CLASSIF_PARs_INT",
     "CLASSIF_PARS_INT": "CLASSIF_PARs_INT",
     "CLASSIF_PARs_INT": "CLASSIF_PARs_INT",
@@ -204,7 +205,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "export_bucket_file",
-        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT), and an optional tag kept for internal categorization. The emitted bucket line writes the classification immediately after the filter string so the file matches known-good Timing Lite syntax.",
+        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT/CLASSIF_WAIVE0P5), and an optional tag kept for internal categorization. The emitted bucket line writes the classification immediately after the filter string so the file matches known-good Timing Lite syntax.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -242,8 +243,8 @@ TOOL_SCHEMA = [
                             },
                             "classification": {
                                 "type": "string",
-                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT", "CLASSIF_PARs_INT"],
-                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix), CLASSIF_PARs_INT (partition internals, PO-owned, untriaged)"
+                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5"],
+                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix), CLASSIF_PARs_INT (partition internals, PO-owned, untriaged), CLASSIF_WAIVE0P5 (0p5 milestone waiver for setup paths within 20% of cycle time)"
                             },
                             "tag": {
                                 "type": "string",
@@ -970,7 +971,35 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 return f"{column_name}:^{re.escape(pin_name)}$"
             return f"{column_name}:(^|/){re.escape(pin_name)}/.*"
 
-        # ── Auto-bucket 2: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
+        # ── Auto-bucket 2: WAIVE0P5 candidates (0p5 milestone waiver, setup only) ──
+        waive0p5_buckets = []
+        waive0p5_total = 0
+        if mode == "setup":
+            waive_row = con.execute(f"""
+                SELECT
+                    COUNT(*) as path_count,
+                    ROUND(MIN(slack), 1) as worst_slack,
+                    ROUND(AVG(slack), 1) as avg_slack,
+                    ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                    ROUND(AVG(levels_of_logic), 0) as avg_lol
+                FROM {source}
+                WHERE {where}
+                  AND clock_percentage > -20
+            """, params).fetchone()
+            if waive_row and waive_row[0]:
+                count, worst_s, avg_s, worst_pct, avg_lol = waive_row
+                waive0p5_total = count
+                waive0p5_buckets.append({
+                    "priority": 1,
+                    "filters": ["PercentPeriod:>-20"],
+                    "classification": "CLASSIF_WAIVE0P5",
+                    "description": f"WAIVE0P5 0p5 milestone waiver ({count} paths, worst {worst_s}ps/{worst_pct}%, avg {avg_s}ps, avg_lol={avg_lol})",
+                    "auto": True,
+                    "path_count": count,
+                    "section": "WAIVE0P5",
+                })
+
+        # ── Auto-bucket 3: PTECO candidates (tiny timing window 0-2%, NOT internal) ──
         pteco = con.execute(f"""
             SELECT
                 launch_clock, capture_clock,
@@ -1012,7 +1041,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "PTECO",
             })
 
-        # ── Auto-bucket 3: EXT paths → group by real partition crossing + clock domain ──
+        # ── Auto-bucket 4: EXT paths → group by real partition crossing + clock domain ──
         ext_paths = con.execute(f"""
             SELECT
                 ({sp_real_part}) as sp_part,
@@ -1058,7 +1087,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "EXT C2C",
             })
 
-        # ── Auto-bucket 4: Top-level input-port paths in the remaining pool ──
+        # ── Auto-bucket 5: Top-level input-port paths in the remaining pool ──
         # These often start from ports like fdfx_security_* and will never match
         # partition-based StartPin filters because they are not hierarchical cell paths.
         pre_remaining_where = (f"{where}"
@@ -1105,6 +1134,7 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
                 "section": "INPUT PORTS",
             })
 
+        _enrich_bucket_descriptions(con, source, where, params, waive0p5_buckets, mode)
         _enrich_bucket_descriptions(con, source, where, params, po_int_buckets, mode)
         _enrich_bucket_descriptions(con, source, where, params, int_c2c_buckets, mode)
         _enrich_bucket_descriptions(con, source, where, params, ext_buckets, mode)
@@ -1113,7 +1143,8 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
         # This is intentionally filter-accurate rather than category-accurate so the
         # LLM sees any auto-bucket misses caused by bad regexes or over-coarse grouping.
         all_auto_buckets = (
-            po_int_buckets
+            waive0p5_buckets
+            + po_int_buckets
             + input_port_buckets
             + int_c2c_buckets
             + pteco_buckets
@@ -1194,12 +1225,13 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1):
             "mode": mode,
             "summary": {"columns": sum_cols, "rows": sum_rows},
             "auto_buckets": {
+                "waive0p5": {"buckets": waive0p5_buckets, "total_paths": waive0p5_total},
                 "po_int": {"buckets": po_int_buckets, "total_paths": po_int_total},
                 "pteco": {"buckets": pteco_buckets, "total_paths": pteco_total},
                 "int_c2c": {"buckets": int_c2c_buckets, "total_paths": int_c2c_total},
                 "ext": {"buckets": ext_buckets, "total_paths": ext_total},
                 "input_ports": {"buckets": input_port_buckets, "total_paths": input_port_total},
-                "note": "INT, EXT, PTECO, and top-level input-port paths are auto-bucketed by Python. Remaining paths go to the LLM.",
+                "note": "WAIVE0P5, INT, EXT, PTECO, and top-level input-port paths are auto-bucketed by Python. Remaining paths go to the LLM.",
             },
             "remaining_c2c_ext": {
                 "total_paths": remaining_count,
@@ -1255,6 +1287,7 @@ def export_bucket_file(buckets, output_path, block, run_label, mode):
     """
     # Define section order for grouping buckets
     SECTION_ORDER = [
+        "WAIVE0P5",
         "PARTITION INTERNALS",
         "INPUT PORTS",
         "EXT C2C",
@@ -1492,6 +1525,14 @@ def _enrich_bucket_descriptions(con, source, base_where, params, buckets, mode):
             bucket["description"] = f"{bucket['description']}; " + "; ".join(additions)
 
 
+def _numeric_filter_condition(column_name, expression):
+    match = re.match(r"^\s*(<=|>=|=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$", str(expression))
+    if not match:
+        return None
+    operator, value = match.groups()
+    return f"{column_name} {operator} {value}"
+
+
 def _bucket_sql_conditions(bucket, mode):
     path_type = "max" if mode == "setup" else "min"
     raw_filters = [f for f in bucket.get("filters", []) if not f.startswith("PathType:")]
@@ -1506,7 +1547,9 @@ def _bucket_sql_conditions(bucket, mode):
         if db_col == "path_type":
             conditions.append(f"path_type = {_sql_literal(path_type)}")
         elif db_col == "clock_percentage":
-            continue
+            numeric_condition = _numeric_filter_condition(db_col, regex_val)
+            if numeric_condition:
+                conditions.append(numeric_condition)
         else:
             safe_regex = regex_val.replace("'", "''")
             conditions.append(f"regexp_matches({db_col}, '{safe_regex}')")
@@ -1888,7 +1931,7 @@ def handle_tool_call(con, tool_name, tool_input):
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
         # Strip any auto-bucketed classifications the LLM created — Python handles those
-        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT", "CLASSIF_PARs_INT"}  # strip if LLM leaks old/wrong names
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5"}  # strip if LLM leaks old/wrong names
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:
@@ -2195,23 +2238,26 @@ def main():
             if summary:
                 console.print(f"  [bold]{summary[0]}[/bold] failing paths, worst slack: [red]{summary[1]}ps[/red]")
             auto = triage_data.get("auto_buckets", {})
+            waive0p5_buckets = auto.get("waive0p5", {}).get("buckets", [])
             po_int_buckets = auto.get("po_int", {}).get("buckets", [])
             pteco_buckets = auto.get("pteco", {}).get("buckets", [])
             int_c2c_buckets = auto.get("int_c2c", {}).get("buckets", [])
             ext_buckets = auto.get("ext", {}).get("buckets", [])
             input_port_buckets = auto.get("input_ports", {}).get("buckets", [])
+            waive0p5_count = auto.get("waive0p5", {}).get("total_paths", 0)
             po_int_count = auto.get("po_int", {}).get("total_paths", 0)
             pteco_count = auto.get("pteco", {}).get("total_paths", 0)
             int_c2c_count = auto.get("int_c2c", {}).get("total_paths", 0)
             ext_count = auto.get("ext", {}).get("total_paths", 0)
             input_port_count = auto.get("input_ports", {}).get("total_paths", 0)
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
-            auto_total = po_int_count + input_port_count + int_c2c_count + pteco_count + ext_count
-            console.print(f"  Auto-bucketed: {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
+            auto_total = waive0p5_count + po_int_count + input_port_count + int_c2c_count + pteco_count + ext_count
+            console.print(f"  Auto-bucketed: {waive0p5_count} WAIVE0P5 ({len(waive0p5_buckets)} buckets) + {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
             # Store exported auto-buckets for merging at export time.
             _auto_buckets_for_export.clear()
+            _auto_buckets_for_export.extend(waive0p5_buckets)
             _auto_buckets_for_export.extend(po_int_buckets)
             _auto_buckets_for_export.extend(input_port_buckets)
             _auto_buckets_for_export.extend(int_c2c_buckets)
@@ -2224,6 +2270,8 @@ def main():
                 "mode": triage_data.get("mode"),
                 "summary": triage_data.get("summary"),
                 "auto_bucket_summary": {
+                    "waive0p5_paths": waive0p5_count,
+                    "waive0p5_buckets": len(waive0p5_buckets),
                     "partition_internals_paths": po_int_count,
                     "partition_internals_buckets": len(po_int_buckets),
                     "input_port_paths": input_port_count,
@@ -2234,7 +2282,7 @@ def main():
                     "ext_buckets": len(ext_buckets),
                     "pteco_paths": pteco_count,
                     "pteco_buckets": len(pteco_buckets),
-                    "note": "Python handles the obvious first-pass buckets. Pass 2 should bucket only the residual set left after those filters are applied.",
+                    "note": "Python handles the obvious first-pass buckets, including the 0p5 milestone waiver bucket. Pass 2 should bucket only the residual set left after those filters are applied.",
                 },
                 "remaining_c2c_ext": triage_data.get("remaining_c2c_ext"),
             }
@@ -2273,6 +2321,7 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
+                    f"  - {waive0p5_count} WAIVE0P5 ({len(waive0p5_buckets)} buckets)\n"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
                     f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
@@ -2297,13 +2346,14 @@ def main():
                     f"8. Print summary: each bucket's category, path count, worst slack, plus final unmatched count."
                 )
             else:
-                auto_count = len(po_int_buckets) + len(input_port_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
+                auto_count = len(waive0p5_buckets) + len(po_int_buckets) + len(input_port_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
                 triage_question = (
                     f"Triage all failing {args.mode} paths in block '{block_label}', run '{run_label}'.\n\n"
                     f"You are triaging as a SECTION TIMING OWNER (STO).\n\n"
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
+                    f"  - {waive0p5_count} WAIVE0P5 ({len(waive0p5_buckets)} buckets)\n"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
                     f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
