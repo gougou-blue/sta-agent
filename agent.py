@@ -312,6 +312,70 @@ TOOL_SCHEMA = [
             "required": ["mode", "buckets"]
         }
     },
+    {
+        "name": "review_auto_buckets",
+        "description": "Inspect the Python-generated auto-buckets before export so you can add a concise LLM hypothesis for each bucket. Returns, for each selected auto-bucket, its current description, filters, summary stats, top path-group mix, top clock-pair mix, and a few worst example paths. Use this to understand what a stable Python bucket appears to contain before calling annotate_auto_buckets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["setup", "hold"],
+                    "description": "setup or hold"
+                },
+                "block": {
+                    "type": "string",
+                    "description": "Block name"
+                },
+                "run_label": {
+                    "type": "string",
+                    "description": "Run label"
+                },
+                "csv_path": {
+                    "type": "string",
+                    "description": "Path to CSV.gz for ad-hoc mode"
+                },
+                "bucket_indexes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional subset of auto-bucket indexes to inspect. Omit to inspect all auto-buckets."
+                },
+                "max_samples": {
+                    "type": "integer",
+                    "description": "How many worst paths to return per bucket (default 3)."
+                }
+            },
+            "required": ["mode"]
+        }
+    },
+    {
+        "name": "annotate_auto_buckets",
+        "description": "Append or replace an LLM-generated explanation for one or more Python auto-buckets while preserving the original Python description. Use after review_auto_buckets. The added text is emitted in the final bucket file as 'LLM description: ...'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "annotations": {
+                    "type": "array",
+                    "description": "LLM descriptions to attach to existing auto-buckets by index.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "bucket_index": {
+                                "type": "integer",
+                                "description": "Index of the auto-bucket within the current Python auto-bucket list"
+                            },
+                            "llm_description": {
+                                "type": "string",
+                                "description": "Short hypothesis for what the bucket likely represents or why it is failing"
+                            }
+                        },
+                        "required": ["bucket_index", "llm_description"]
+                    }
+                }
+            },
+            "required": ["annotations"]
+        }
+    },
 ]
 
 
@@ -1460,6 +1524,142 @@ def _build_unmatched_where(base_where, buckets, mode):
     return base_where
 
 
+def review_auto_buckets(con, mode, block=None, run_label=None, csv_path=None, bucket_indexes=None, max_samples=3):
+    """Return context for current Python auto-buckets so the LLM can assess them."""
+    try:
+        if csv_path:
+            source = _csv_source_with_aliases(con, csv_path)
+            base_where = "slack < 0"
+            params = []
+        else:
+            source = "paths"
+            base_where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
+            params = [block, run_label, mode]
+
+        selected = set(bucket_indexes) if bucket_indexes is not None else None
+        reviews = []
+        max_samples = max(1, min(int(max_samples or 3), 10))
+
+        for index, bucket in enumerate(_auto_buckets_for_export):
+            if selected is not None and index not in selected:
+                continue
+
+            conditions = _bucket_sql_conditions(bucket, mode)
+            if not conditions:
+                reviews.append({
+                    "bucket_index": index,
+                    "section": bucket.get("section", "OTHER"),
+                    "classification": bucket.get("classification", ""),
+                    "current_description": bucket.get("description", ""),
+                    "filters": bucket.get("filters", []),
+                    "error": "no valid filters",
+                })
+                continue
+
+            full_where = f"{base_where} AND {' AND '.join(conditions)}"
+            summary_row = con.execute(f"""
+                SELECT
+                    COUNT(*) as total_paths,
+                    ROUND(MIN(slack), 1) as worst_slack,
+                    ROUND(AVG(slack), 1) as avg_slack,
+                    ROUND(MIN(clock_percentage), 1) as worst_clock_pct,
+                    ROUND(AVG(levels_of_logic), 1) as avg_lol,
+                    COUNT(DISTINCT COALESCE(path_group, '')) as path_group_count,
+                    COUNT(DISTINCT COALESCE(launch_clock, '') || '->' || COALESCE(capture_clock, '')) as clock_pair_count
+                FROM {source}
+                WHERE {full_where}
+            """, params).fetchone()
+
+            top_groups = con.execute(f"""
+                SELECT COALESCE(path_group, 'NA') as path_group, COUNT(*) as path_count
+                FROM {source}
+                WHERE {full_where}
+                GROUP BY path_group
+                ORDER BY path_count DESC, path_group
+                LIMIT 3
+            """, params).fetchall()
+
+            top_clocks = con.execute(f"""
+                SELECT COALESCE(launch_clock, 'NA') || '->' || COALESCE(capture_clock, 'NA') as clock_pair,
+                       COUNT(*) as path_count
+                FROM {source}
+                WHERE {full_where}
+                GROUP BY clock_pair
+                ORDER BY path_count DESC, clock_pair
+                LIMIT 3
+            """, params).fetchall()
+
+            worst_paths_result = con.execute(f"""
+                SELECT startpoint, endpoint, launch_clock, capture_clock,
+                       path_group, slack, clock_percentage, levels_of_logic
+                FROM {source}
+                WHERE {full_where}
+                ORDER BY slack ASC
+                LIMIT {max_samples}
+            """, params)
+            sample_cols = [d[0] for d in worst_paths_result.description]
+            sample_rows = [list(r) for r in worst_paths_result.fetchall()]
+
+            reviews.append({
+                "bucket_index": index,
+                "section": bucket.get("section", "OTHER"),
+                "classification": bucket.get("classification", ""),
+                "current_description": bucket.get("description", ""),
+                "filters": bucket.get("filters", []),
+                "summary": {
+                    "total_paths": summary_row[0] if summary_row else 0,
+                    "worst_slack": summary_row[1] if summary_row else None,
+                    "avg_slack": summary_row[2] if summary_row else None,
+                    "worst_clock_pct": summary_row[3] if summary_row else None,
+                    "avg_lol": summary_row[4] if summary_row else None,
+                    "path_group_count": summary_row[5] if summary_row else 0,
+                    "clock_pair_count": summary_row[6] if summary_row else 0,
+                },
+                "top_path_groups": [
+                    {"path_group": row[0], "count": row[1]} for row in top_groups
+                ],
+                "top_clock_pairs": [
+                    {"clock_pair": row[0], "count": row[1]} for row in top_clocks
+                ],
+                "worst_paths": {"columns": sample_cols, "rows": sample_rows},
+            })
+
+        return {
+            "auto_bucket_count": len(_auto_buckets_for_export),
+            "reviewed_bucket_count": len(reviews),
+            "buckets": reviews,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def annotate_auto_buckets(annotations):
+    """Append or replace LLM description text on the Python auto-buckets."""
+    try:
+        updated = []
+        for annotation in annotations:
+            bucket_index = annotation["bucket_index"]
+            llm_description = annotation["llm_description"].strip()
+            if bucket_index < 0 or bucket_index >= len(_auto_buckets_for_export):
+                updated.append({"bucket_index": bucket_index, "error": "index out of range"})
+                continue
+            if not llm_description:
+                updated.append({"bucket_index": bucket_index, "error": "empty llm_description"})
+                continue
+
+            bucket = _auto_buckets_for_export[bucket_index]
+            base_desc = re.sub(r"; LLM description: .*?$", "", bucket.get("description", "")).rstrip()
+            bucket["description"] = f"{base_desc}; LLM description: {llm_description}"
+            updated.append({
+                "bucket_index": bucket_index,
+                "section": bucket.get("section", "OTHER"),
+                "description": bucket["description"],
+            })
+        return {"updated": updated}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
     """Test bucket filter coverage against actual failing paths.
 
@@ -1735,6 +1935,24 @@ def handle_tool_call(con, tool_name, tool_input):
             console.print(f"  Unmatched: {unmatched} paths ({pct}%) — target <5% — {status}")
         else:
             console.print(f"[red]{result['error']}[/red]")
+        return json.dumps(result, default=str)
+
+    elif tool_name == "review_auto_buckets":
+        result = review_auto_buckets(
+            con,
+            tool_input["mode"],
+            block=tool_input.get("block"),
+            run_label=tool_input.get("run_label"),
+            csv_path=tool_input.get("csv_path"),
+            bucket_indexes=tool_input.get("bucket_indexes"),
+            max_samples=tool_input.get("max_samples", 3),
+        )
+        return json.dumps(result, default=str)
+
+    elif tool_name == "annotate_auto_buckets":
+        result = annotate_auto_buckets(tool_input["annotations"])
+        if "error" not in result:
+            console.print(f"\n[dim]Annotated {len([r for r in result['updated'] if 'error' not in r])} auto-buckets with LLM descriptions.[/dim]\n")
         return json.dumps(result, default=str)
 
     return json.dumps({"error": f"Unknown tool: {tool_name}"})
@@ -2064,18 +2282,19 @@ def main():
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n\n"
                     f"{existing_bucket_prompt}"
                     f"Workflow:\n"
-                    f"1. If remaining paths exist, use query_timing_db on the temp view "
+                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) and produce a short hypothesis for each Python auto-bucket. Then call annotate_auto_buckets(...) so each preserved auto-bucket gets an added 'LLM description: ...' suffix while keeping the original Python description. Keep these short and high-level.\n"
+                    f"2. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
                     f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
-                    f"2. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
-                    f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
+                    f"3. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
+                    f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"4. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
+                    f"5. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
                     f"   Validation automatically includes Python auto-buckets.\n"
-                    f"5. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
-                    f"6. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
+                    f"6. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
+                    f"7. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
                     f"   If no remaining paths, pass buckets=[].\n"
-                    f"7. Print summary: each bucket's category, path count, worst slack, plus final unmatched count."
+                    f"8. Print summary: each bucket's category, path count, worst slack, plus final unmatched count."
                 )
             else:
                 auto_count = len(po_int_buckets) + len(input_port_buckets) + len(int_c2c_buckets) + len(pteco_buckets) + len(ext_buckets)
@@ -2095,19 +2314,20 @@ def main():
                     f"These are the actual failing paths left after Python auto-bucket filters are applied.\n\n"
                     f"{existing_bucket_prompt}"
                     f"Workflow:\n"
-                    f"1. If remaining paths exist, use query_timing_db on the temp view "
+                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) and produce a short hypothesis for each Python auto-bucket. Then call annotate_auto_buckets(...) so each preserved auto-bucket gets an added 'LLM description: ...' suffix while keeping the original Python description. Keep these short and high-level.\n"
+                    f"2. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
                     f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
-                    f"2. Classify: HRP (high logic depth), ECO (small slack), CON (constraints).\n"
-                    f"3. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
+                    f"3. Classify: HRP (high logic depth), ECO (small slack), CON (constraints).\n"
+                    f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"4. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
+                    f"5. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
                     f"   Validation automatically includes Python's {auto_count} auto-buckets.\n"
-                    f"5. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
-                    f"6. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
+                    f"6. If validation reports unmatched paths, query the returned unmatched_view with query_timing_db, refine your buckets, and validate again. Do up to 3 total validation rounds before exporting.\n"
+                    f"7. Only when coverage is acceptable, call export_bucket_file({export_params}, buckets=<your final remaining buckets only>).\n"
                     f"   Python will prepend the {auto_count} auto-buckets.\n"
                     f"   If no remaining paths, pass buckets=[].\n"
-                    f"7. Print triage summary: bucket #, classification, path count, worst slack, plus final unmatched count."
+                    f"8. Print triage summary: bucket #, classification, path count, worst slack, plus final unmatched count."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
                       model=model, reports_dir=args.reports_dir, max_tokens=32768)
