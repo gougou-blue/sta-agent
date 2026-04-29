@@ -625,6 +625,61 @@ def resolve_triage_csv_path(reports_dir, mode, persona="sto", partition=None):
         "selection_reason": "first matching report_summary CSV",
     }
 
+def _partition_expr_sql(pin_col, leaf_depth=1, top_level_leaf_parts=None, partition_col=None):
+    """Return SQL expression for the real partition name for a hierarchical pin."""
+    top_level_leaf_parts = set(top_level_leaf_parts or [])
+    top_part = f"split_part({pin_col}, '/', 1)"
+    if leaf_depth > 1:
+        if top_level_leaf_parts:
+            top_list = ", ".join(f"'{part}'" for part in sorted(top_level_leaf_parts))
+            base_expr = (
+                f"CASE "
+                f"WHEN {pin_col} NOT LIKE '%/%' THEN {top_part} "
+                f"WHEN {top_part} IN ({top_list}) THEN {top_part} "
+                f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
+            )
+        else:
+            base_expr = (
+                f"CASE "
+                f"WHEN {pin_col} NOT LIKE '%/%' THEN {top_part} "
+                f"ELSE split_part({pin_col}, '/', {leaf_depth}) END"
+            )
+    else:
+        base_expr = top_part
+
+    if partition_col:
+        return f"COALESCE({partition_col}, {base_expr})"
+    return base_expr
+
+
+def _append_scope_filter(base_where, extra_scope):
+    if not extra_scope:
+        return base_where
+    return f"({base_where}) AND ({extra_scope})"
+
+
+def _current_po_scope_sql(block=None):
+    """Return the active PO scope SQL for validate/review helper calls, if any."""
+    scope = _active_triage_scope or {}
+    if scope.get("persona") != "po":
+        return None
+
+    partition = scope.get("partition")
+    if not partition:
+        return None
+
+    scoped_block = block or scope.get("block")
+    leaf_depth = scope.get("leaf_depth", 1)
+    top_level_leaf_parts = set(BLOCKS.get(scoped_block, {}).get("leaf_partitions_n1", [])) if scoped_block else set()
+    sp_part = _partition_expr_sql("startpoint", leaf_depth, top_level_leaf_parts, "driver_partition")
+    ep_part = _partition_expr_sql("endpoint", leaf_depth, top_level_leaf_parts, "receiver_partition")
+    partition_sql = _sql_literal(partition)
+    return (
+        f"(({sp_part}) = {partition_sql}) "
+        f"AND (({ep_part}) = {partition_sql}) "
+        f"AND (child_int_type = 'INT_AllChildren' OR int_ext = 'INT')"
+    )
+
 
 def list_report_files(block=None, run_label=None, mode=None, reports_dir=None):
     """List .rpt.gz files in the reports directory."""
@@ -1793,6 +1848,10 @@ def review_auto_buckets(con, mode, block=None, run_label=None, csv_path=None, bu
             base_where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
             params = [block, run_label, mode]
 
+        scope_sql = _current_po_scope_sql(block=block)
+        if scope_sql:
+            base_where = _append_scope_filter(base_where, scope_sql)
+
         if bucket_indexes is not None:
             selected_indexes = sorted(set(bucket_indexes))
             selected = set(selected_indexes)
@@ -1958,6 +2017,11 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
             )
             params = [block, run_label, mode]
 
+        scope_sql = _current_po_scope_sql(block=block)
+        if scope_sql:
+            base_where = _append_scope_filter(base_where, scope_sql)
+            base_where_sql = _append_scope_filter(base_where_sql, scope_sql)
+
         path_type = "max" if mode == "setup" else "min"
 
         # Get total failing
@@ -2065,6 +2129,7 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
 # Auto-buckets (PO_INT + PTECO) created by Python during triage — merged into export
 _auto_buckets_for_export = []
 _last_exported_bucket_path = None
+_active_triage_scope = {}
 
 
 def handle_tool_call(con, tool_name, tool_input):
@@ -2479,6 +2544,13 @@ def main():
             # Pre-call triage_timing_run in Python (avoids LLM path typos & saves a tool round-trip)
             console.print(f"\n[dim]Running triage analysis...[/dim]")
             ldepth = BLOCKS.get(block_label, {}).get("leaf_depth", 1) if block_label else 1
+            _active_triage_scope.clear()
+            _active_triage_scope.update({
+                "persona": persona,
+                "partition": partition,
+                "block": block_label,
+                "leaf_depth": ldepth,
+            })
             triage_data = triage_timing_run(
                 con,
                 block_label,
