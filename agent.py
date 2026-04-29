@@ -467,24 +467,34 @@ def load_existing_bucket_file(bucket_path):
             if line.startswith("#"):
                 continue
 
-            match = re.match(
-                r"^(?P<priority>\d+)\s+(?P<filters>\S+)\s+(?P<classification>CLASSIF_[A-Za-z0-9_]+|Partition_Internals)\s*(?P<rest>.*)$",
-                line,
-            )
+            match = re.match(r"^(?P<priority>\d+)\s+(?P<filters>\S+)\s+(?P<rest>.+)$", line)
             if not match:
                 skipped_lines.append({"line": line_number, "reason": "unparsed"})
                 continue
 
-            rest = match.group("rest").strip()
-            rest_tokens = rest.split()
-            while rest_tokens and rest_tokens[0].startswith(("OWNER_", "TRIAGER_", "TAG_")):
-                rest_tokens.pop(0)
+            rest_tokens = match.group("rest").split()
+            class_index = next(
+                (
+                    index for index, token in enumerate(rest_tokens)
+                    if re.fullmatch(r"CLASSIF_[A-Za-z0-9_]+", token) or token == "Partition_Internals"
+                ),
+                None,
+            )
+            if class_index is None:
+                skipped_lines.append({"line": line_number, "reason": "missing_classification"})
+                continue
+
+            classification = rest_tokens[class_index]
+            description_tokens = [
+                token for index, token in enumerate(rest_tokens)
+                if index != class_index and not token.startswith(("OWNER_", "TRIAGER_", "TAG_"))
+            ]
 
             buckets.append({
                 "priority": int(match.group("priority")),
                 "filters": [f for f in match.group("filters").split("&&") if f],
-                "classification": _normalize_bucket_classification(match.group("classification")),
-                "description": " ".join(rest_tokens),
+                "classification": _normalize_bucket_classification(classification),
+                "description": " ".join(description_tokens),
             })
 
     if not buckets:
