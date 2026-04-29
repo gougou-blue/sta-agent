@@ -573,6 +573,58 @@ def get_reports_dir(block, run_label, mode):
                 return os.path.dirname(csv_path)
     return None
 
+def resolve_triage_csv_path(reports_dir, mode, persona="sto", partition=None):
+    """Resolve the CSV to use for ad-hoc triage from a reports directory or direct file path.
+
+    In PO mode, require a partition-specific report such as
+    <partition>.*.report_summary.max.csv.gz when resolving from a reports directory.
+    """
+    suffix_base = f"report_summary.{'max' if mode == 'setup' else 'min'}.csv"
+    suffixes = [f"{suffix_base}.gz", suffix_base]
+
+    if os.path.isfile(reports_dir):
+        return {
+            "csv_path": reports_dir,
+            "selection_reason": "direct file path",
+        }
+
+    if not os.path.isdir(reports_dir):
+        return {
+            "error": f"Directory not found: {reports_dir}",
+        }
+
+    candidates = sorted(
+        f for f in os.listdir(reports_dir)
+        if any(f.endswith(suffix) for suffix in suffixes)
+    )
+    if not candidates:
+        return {
+            "error": f"No *{suffixes[0]} or *{suffixes[1]} found in {reports_dir}",
+        }
+
+    if persona == "po" and partition:
+        partition_prefixes = [f"{partition}.", f"{partition}_"]
+        preferred = [
+            f for f in candidates
+            if any(f.startswith(prefix) for prefix in partition_prefixes)
+        ]
+        if preferred:
+            return {
+                "csv_path": os.path.join(reports_dir, preferred[0]),
+                "selection_reason": f"partition-specific report for {partition}",
+            }
+        return {
+            "error": (
+                f"Partition report not found for '{partition}' in {reports_dir}. "
+                f"Expected a file matching {partition}.*.{suffix_base}[.gz]"
+            ),
+        }
+
+    return {
+        "csv_path": os.path.join(reports_dir, candidates[0]),
+        "selection_reason": "first matching report_summary CSV",
+    }
+
 
 def list_report_files(block=None, run_label=None, mode=None, reports_dir=None):
     """List .rpt.gz files in the reports directory."""
@@ -2375,39 +2427,40 @@ def main():
             if not args.mode:
                 console.print("[red]--triage requires --mode (setup or hold)[/red]")
                 sys.exit(1)
+            persona = args.persona or 'sto'
+            partition = args.partition
+            if persona == 'po' and not partition:
+                console.print("[red]--persona po requires --partition <partition_name>[/red]")
+                sys.exit(1)
             # Determine CSV path for ad-hoc triage
             csv_path = None
+            csv_selection_reason = None
             if args.reports_dir:
-                # Find the matching CSV in the reports dir
-                suffix = f"report_summary.{'max' if args.mode == 'setup' else 'min'}.csv.gz"
-                if os.path.isdir(args.reports_dir):
-                    for f in os.listdir(args.reports_dir):
-                        if f.endswith(suffix):
-                            csv_path = os.path.join(args.reports_dir, f)
-                            break
-                if not csv_path:
-                    # Try using reports_dir as a direct file path
-                    if os.path.isfile(args.reports_dir):
-                        csv_path = args.reports_dir
-                    else:
-                        console.print(f"[red]No *{suffix} found in {args.reports_dir}[/red]")
-                        sys.exit(1)
+                resolved = resolve_triage_csv_path(
+                    args.reports_dir,
+                    args.mode,
+                    persona=persona,
+                    partition=partition,
+                )
+                if "error" in resolved:
+                    console.print(f"[red]{resolved['error']}[/red]")
+                    sys.exit(1)
+                csv_path = resolved["csv_path"]
+                csv_selection_reason = resolved.get("selection_reason")
             elif not args.block or not args.run:
                 console.print("[red]--triage requires either (--block + --run) or --reports-dir[/red]")
                 sys.exit(1)
 
             block_label = args.block or os.path.basename(csv_path or 'unknown').split('.')[0]
             run_label = args.run or csv_path or 'ad-hoc'
-            persona = args.persona or 'sto'
-            partition = args.partition
             output_path = args.output or f"./buckets/{block_label}_{args.mode}.bucket"
             existing_bucket_data = None
 
             if persona == 'po':
-                if not partition:
-                    console.print("[red]--persona po requires --partition <partition_name>[/red]")
-                    sys.exit(1)
                 output_path = args.output or f"./buckets/{partition}_{args.mode}.bucket"
+
+            if csv_selection_reason:
+                console.print(f"  [dim]Using {csv_selection_reason}: {csv_path}[/dim]")
 
             if args.existing_bucket:
                 try:

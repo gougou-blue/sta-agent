@@ -88,6 +88,7 @@ python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --
 | `--persona po -p <partition>` | Partition Owner | Internal paths within the selected partition only; detailed sub-buckets by logic cone, severity, FC recipe |
 
 PO mode scopes triage to failing paths whose startpoint and endpoint both resolve to the selected partition. It excludes STO-owned C2C, EXT, input-port, and PTECO paths from the PO bucket file.
+When you use `--reports-dir` in PO mode, the agent requires a partition-specific summary CSV like `pard2d4uladda1.func.max_nom.TT_100.tttt.report_summary.max.csv.gz`. If that partition report is missing, PO triage fails with a report-not-found error.
 
 The agent will:
 1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
