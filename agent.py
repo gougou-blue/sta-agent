@@ -2314,6 +2314,7 @@ def main():
             remaining = triage_data.get("remaining_c2c_ext", {}).get("total_paths", 0)
             auto_total = waiver_count + po_int_count + input_port_count + int_c2c_count + pteco_count + ext_count
             waiver_console = f"{waiver_count} {waiver_section} ({len(waiver_buckets)} buckets) + " if waiver_buckets else ""
+            waiver_prompt_line = f"  - {waiver_count} {waiver_section} ({len(waiver_buckets)} buckets)\n" if waiver_buckets else ""
             console.print(f"  Auto-bucketed: {waiver_console}{po_int_count} Partition_Internals ({len(po_int_buckets)} buckets) + {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets) + {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets) + {ext_count} EXT ({len(ext_buckets)} buckets) + {pteco_count} PTECO ({len(pteco_buckets)} buckets)")
             console.print(f"  Remaining for LLM: {remaining} paths\n")
 
@@ -2384,7 +2385,7 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
-                    f"{'  - ' + str(waiver_count) + ' ' + waiver_section + ' (' + str(len(waiver_buckets)) + ' buckets)\\n' if waiver_buckets else ''}"
+                    f"{waiver_prompt_line}"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
                     f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
@@ -2416,7 +2417,7 @@ def main():
                     f"Here is the triage data (already computed — do NOT call triage_timing_run):\n"
                     f"{triage_json}\n\n"
                     f"IMPORTANT: Python has already auto-bucketed ALL paths:\n"
-                    f"{'  - ' + str(waiver_count) + ' ' + waiver_section + ' (' + str(len(waiver_buckets)) + ' buckets)\\n' if waiver_buckets else ''}"
+                    f"{waiver_prompt_line}"
                     f"  - {po_int_count} Partition_Internals ({len(po_int_buckets)} buckets)\n"
                     f"  - {input_port_count} INPUT PORTS ({len(input_port_buckets)} buckets)\n"
                     f"  - {int_c2c_count} INT_C2C ({len(int_c2c_buckets)} buckets)\n"
