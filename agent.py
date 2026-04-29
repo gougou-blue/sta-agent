@@ -1646,12 +1646,27 @@ def review_auto_buckets(con, mode, block=None, run_label=None, csv_path=None, bu
             base_where = "block = ? AND run_label = ? AND mode = ? AND slack < 0"
             params = [block, run_label, mode]
 
-        selected = set(bucket_indexes) if bucket_indexes is not None else None
+        if bucket_indexes is not None:
+            selected_indexes = sorted(set(bucket_indexes))
+            selected = set(selected_indexes)
+            review_mode = "explicit_indexes"
+            review_limit = None
+        else:
+            review_limit = 40
+            selected_indexes = [
+                index for index, _bucket in sorted(
+                    enumerate(_auto_buckets_for_export),
+                    key=lambda item: item[1].get("path_count", 0),
+                    reverse=True,
+                )[:review_limit]
+            ]
+            selected = set(selected_indexes)
+            review_mode = "largest_buckets"
         reviews = []
         max_samples = max(1, min(int(max_samples or 3), 10))
 
         for index, bucket in enumerate(_auto_buckets_for_export):
-            if selected is not None and index not in selected:
+            if index not in selected:
                 continue
 
             conditions = _bucket_sql_conditions(bucket, mode)
@@ -1736,7 +1751,11 @@ def review_auto_buckets(con, mode, block=None, run_label=None, csv_path=None, bu
 
         return {
             "auto_bucket_count": len(_auto_buckets_for_export),
+            "review_mode": review_mode,
+            "review_limit": review_limit,
             "reviewed_bucket_count": len(reviews),
+            "omitted_bucket_count": max(0, len(_auto_buckets_for_export) - len(reviews)),
+            "selected_bucket_indexes": selected_indexes,
             "buckets": reviews,
         }
     except Exception as e:
@@ -2405,7 +2424,7 @@ def main():
                     f"Your job: create buckets ONLY for the {remaining} remaining paths (if any).\n\n"
                     f"{existing_bucket_prompt}"
                     f"Workflow:\n"
-                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) and produce a short hypothesis for each Python auto-bucket. Then call annotate_auto_buckets(...) so each preserved auto-bucket gets an added 'LLM description: ...' suffix while keeping the original Python description. Keep these short and high-level.\n"
+                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) to inspect a representative subset of the Python auto-buckets. If the auto-bucket count is large, do NOT try to review or annotate every auto-bucket in one pass. Add short, high-level LLM descriptions only to the reviewed subset with annotate_auto_buckets(...).\n"
                     f"2. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
                     f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
@@ -2438,7 +2457,7 @@ def main():
                     f"These are the actual failing paths left after Python auto-bucket filters are applied.\n\n"
                     f"{existing_bucket_prompt}"
                     f"Workflow:\n"
-                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) and produce a short hypothesis for each Python auto-bucket. Then call annotate_auto_buckets(...) so each preserved auto-bucket gets an added 'LLM description: ...' suffix while keeping the original Python description. Keep these short and high-level.\n"
+                    f"1. Call review_auto_buckets({validate_params}, max_samples=3) to inspect a representative subset of the Python auto-buckets. If the auto-bucket count is large, do NOT try to review or annotate every auto-bucket in one pass. Add short, high-level LLM descriptions only to the reviewed subset with annotate_auto_buckets(...).\n"
                     f"2. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
                     f"to inspect the raw residual paths. The remaining_c2c_ext summaries are hints only.\n"
