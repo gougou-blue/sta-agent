@@ -1011,9 +1011,21 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1, 
         def _pin_filter(column_name, pin_name, is_port):
             if not pin_name:
                 return None
+            if is_port:
+                base_name = re.sub(r"\[[^\]]+\]$", "", pin_name)
+                return f"{column_name}:^{re.escape(base_name)}(\\[[^\\]]+\\])?$"
             if pin_name not in known_partition_names:
                 return f"{column_name}:^{re.escape(pin_name)}$"
             return f"{column_name}:(^|/){re.escape(pin_name)}/.*"
+
+        def _ext_group_label(group_name):
+            if group_name == "__INPUT_PORTS__":
+                return "INPUT PORTS"
+            if group_name == "__OUTPUT_PORTS__":
+                return "OUTPUT PORTS"
+            if group_name == "__FEED_THROUGH__":
+                return "FEED_THROUGH"
+            return group_name
 
         # ── Auto-bucket 2: milestone waiver bucket (optional) ──
         waiver_buckets = []
@@ -1093,8 +1105,22 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1, 
         # ── Auto-bucket 4: EXT paths → group by real partition crossing + clock domain ──
         ext_paths = con.execute(f"""
             SELECT
-                ({sp_real_part}) as sp_part,
-                ({ep_real_part}) as ep_part,
+                CASE
+                    WHEN {_is_port_expr('startpoint', 'start')} THEN
+                        CASE
+                            WHEN path_group = 'FEED_THROUGH' THEN '__FEED_THROUGH__'
+                            ELSE '__INPUT_PORTS__'
+                        END
+                    ELSE ({sp_real_part})
+                END as sp_part,
+                CASE
+                    WHEN {_is_port_expr('endpoint', 'end')} THEN
+                        CASE
+                            WHEN path_group = 'FEED_THROUGH' THEN '__FEED_THROUGH__'
+                            ELSE '__OUTPUT_PORTS__'
+                        END
+                    ELSE ({ep_real_part})
+                END as ep_part,
                 {_is_port_expr('startpoint', 'start')} as sp_is_port,
                 {_is_port_expr('endpoint', 'end')} as ep_is_port,
                 COUNT(*) as path_count,
@@ -1118,13 +1144,31 @@ def triage_timing_run(con, block, run_label, mode, csv_path=None, leaf_depth=1, 
                 continue
             ext_total += count
             # Determine crossing description
-            if sp_part == ep_part:
-                crossing = sp_part
+            sp_label = _ext_group_label(sp_part)
+            ep_label = _ext_group_label(ep_part)
+            if sp_label == ep_label:
+                crossing = sp_label
             else:
-                crossing = f"{sp_part}->{ep_part}"
-            sp_filter = _pin_filter("StartPin", sp_part, sp_is_port)
-            ep_filter = _pin_filter("EndPin", ep_part, ep_is_port)
-            filters = [flt for flt in [sp_filter, ep_filter] if flt]
+                crossing = f"{sp_label}->{ep_label}"
+
+            filters = []
+            if sp_is_port and ep_is_port:
+                filters.append("PathGroup:FEED_THROUGH")
+            else:
+                if sp_is_port:
+                    filters.append("PathGroup:INPUT_PATHS")
+                else:
+                    sp_filter = _pin_filter("StartPin", sp_part, sp_is_port)
+                    if sp_filter:
+                        filters.append(sp_filter)
+
+                if ep_is_port:
+                    filters.append("PathGroup:OUTPUT_PATHS")
+                else:
+                    ep_filter = _pin_filter("EndPin", ep_part, ep_is_port)
+                    if ep_filter:
+                        filters.append(ep_filter)
+
             ext_buckets.append({
                 "priority": 85,
                 "filters": filters,
