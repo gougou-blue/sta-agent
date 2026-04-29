@@ -72,6 +72,7 @@ python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m hold --m
 
 # PO mode — drills into a specific partition's internal paths
 python3 agent.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m setup
+python3 agent.py --triage --persona po -p pard2d1uladda1 --reports-dir /path/to/sta_pt/.../reports/ -m setup
 
 # Specify output path
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
@@ -84,7 +85,9 @@ python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --
 | Flag | Role | Focus |
 |------|------|-------|
 | `--persona sto` (default) | Section Timing Owner | C2C and EXT paths; partition internals lumped as PO_INT |
-| `--persona po -p <partition>` | Partition Owner | Internal paths within the partition; detailed sub-buckets by logic cone, severity, FC recipe |
+| `--persona po -p <partition>` | Partition Owner | Internal paths within the selected partition only; detailed sub-buckets by logic cone, severity, FC recipe |
+
+PO mode scopes triage to failing paths whose startpoint and endpoint both resolve to the selected partition. It excludes STO-owned C2C, EXT, input-port, and PTECO paths from the PO bucket file.
 
 The agent will:
 1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
