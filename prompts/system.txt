@@ -151,8 +151,12 @@ The number of buckets is not fixed — it is determined by how many distinct gro
 
 ### Owner Classification (from auto-triage rules)
 Assign each bucket a classification AND a tag. Valid classifications:
-- **CLASSIF_WAIVE0P5**: Setup paths failing by less than 20% of cycle time during the 0p5 milestone.
-   Auto-assigned by Python as `PercentPeriod:>-20`. These paths are intentionally waived from deeper triage for the current milestone.
+- **CLASSIF_WAIVE0P5 / CLASSIF_WAIVE0P8**: Milestone waiver buckets auto-assigned by Python when a waiver profile is enabled.
+   - `0p5` setup: `PercentPeriod:>-20`
+   - `0p5` hold: `Slack:>-100`
+   - `0p8` setup: `PercentPeriod:>-5`
+   - `0p8` hold: `Slack:>-30`
+   These paths are intentionally waived from deeper triage for the current milestone. At `1p0`, no waiver bucket should be created.
 - **CLASSIF_PARs_INT**: Partition-internal paths (INT, same partition). PO-owned, not triaged by STO.
   Auto-assigned by Python — do NOT use this in LLM-created buckets.
   Tag: TAG_PO

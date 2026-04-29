@@ -66,6 +66,10 @@ Auto-bucket failing paths and generate a timinglite-compatible bucket file:
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
 python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
 
+# Enable milestone-specific waiver buckets
+python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --milestone 0p5
+python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m hold --milestone 0p8
+
 # PO mode — drills into a specific partition's internal paths
 python3 agent.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m setup
 
@@ -92,6 +96,11 @@ The agent will:
    ```
 
 If you pass `--existing-bucket`, the agent parses the active bucket lines from that file and uses them as the starting STO bucket set for the new run. It keeps buckets that still match, fixes or drops stale ones, and adds new residual buckets as needed. Python still regenerates the auto-buckets for partition internals, EXT, INT_C2C, input ports, and PTECO for the current run.
+
+If you pass `--milestone`, Python can also auto-create a milestone waiver bucket before LLM triage:
+- `0p5` setup uses `PercentPeriod:>-20`; `0p5` hold uses `Slack:>-100`
+- `0p8` setup uses `PercentPeriod:>-5`; `0p8` hold uses `Slack:>-30`
+- `1p0` disables waiver buckets
 
 ## Recommended team model
 

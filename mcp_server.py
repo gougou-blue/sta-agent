@@ -168,7 +168,7 @@ def read_report(
 
 
 @mcp.tool()
-def triage_timing_run(block: str = "", run_label: str = "", mode: str = "setup", csv_path: str = "") -> str:
+def triage_timing_run(block: str = "", run_label: str = "", mode: str = "setup", csv_path: str = "", milestone: str = "") -> str:
     """Analyze all failing paths (up to 200K) in a block/run and group into triage bucket candidates.
 
     Groups paths by clock domains, partition crossings, path types, and logic depth.
@@ -184,6 +184,7 @@ def triage_timing_run(block: str = "", run_label: str = "", mode: str = "setup",
         run_label: Run label (e.g. 26ww14.3) — for pre-ingested data.
         mode: 'setup' or 'hold'.
         csv_path: Path to a CSV.gz timing report on NFS — for ad-hoc triage without ingesting.
+        milestone: Optional waiver profile: 0p5, 0p8, or 1p0. 0p5 and 0p8 enable milestone waiver buckets; 1p0 disables them.
     """
     result = _triage_timing_run(
         _get_con(),
@@ -191,6 +192,7 @@ def triage_timing_run(block: str = "", run_label: str = "", mode: str = "setup",
         run_label or None,
         mode,
         csv_path=csv_path or None,
+        milestone=milestone or None,
     )
     return json.dumps(result, default=str)
 
