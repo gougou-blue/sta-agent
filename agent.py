@@ -49,7 +49,7 @@ LEGACY_BUCKET_CLASSIFICATIONS = {
     "CLASSIF_CONSTRAINTS": "CLASSIF_CONS",
     "CLASSIF_CONS": "CLASSIF_CONS",
     "CLASSIF_PTECO": "CLASSIF_OPT",
-    "CLASSIF_PO_OPT": "CLASSIF_OPT",
+    "CLASSIF_PO_OPT": "CLASSIF_PO_OPT",
     "CLASSIF_OPT": "CLASSIF_OPT",
     "CLASSIF_FCT": "CLASSIF_FCT",
     "CLASSIF_WAIVE0P5": "CLASSIF_WAIVE0P5",
@@ -239,7 +239,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "export_bucket_file",
-        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_FCT/CLASSIF_WAIVE0P5/CLASSIF_WAIVE0P8), and an optional tag kept for internal categorization. The emitted bucket line writes the classification immediately after the filter string so the file matches known-good Timing Lite syntax.",
+        "description": "Generate a timinglite-compatible bucket file from triage results. Each bucket has filter expressions (timinglite syntax), a classification (CLASSIF_CONS/CLASSIF_OPT/CLASSIF_PO_OPT/CLASSIF_FCT/CLASSIF_WAIVE0P5/CLASSIF_WAIVE0P8), and an optional tag kept for internal categorization. The emitted bucket line writes the classification immediately after the filter string so the file matches known-good Timing Lite syntax.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -277,8 +277,8 @@ TOOL_SCHEMA = [
                             },
                             "classification": {
                                 "type": "string",
-                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_FCT", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5", "CLASSIF_WAIVE0P8"],
-                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (PTECO/optimization), CLASSIF_FCT (floorplan/manual fix), CLASSIF_PARs_INT (partition internals, PO-owned, untriaged), CLASSIF_WAIVE0P5/CLASSIF_WAIVE0P8 (milestone waiver buckets)"
+                                "enum": ["CLASSIF_CONS", "CLASSIF_OPT", "CLASSIF_PO_OPT", "CLASSIF_FCT", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5", "CLASSIF_WAIVE0P8"],
+                                "description": "CLASSIF_CONS (constraints), CLASSIF_OPT (STO optimization/PTECO), CLASSIF_PO_OPT (PO-owned optimization/internal fixes), CLASSIF_FCT (floorplan/manual fix, typically STO/C2C/EXT), CLASSIF_PARs_INT (partition internals, PO-owned, untriaged), CLASSIF_WAIVE0P5/CLASSIF_WAIVE0P8 (milestone waiver buckets)"
                             },
                             "tag": {
                                 "type": "string",
@@ -2244,7 +2244,7 @@ def handle_tool_call(con, tool_name, tool_input):
         output_path = tool_input["output_path"]
         llm_buckets = tool_input["buckets"]
         # Strip any auto-bucketed classifications the LLM created — Python handles those
-        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PO_OPT", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5", "CLASSIF_WAIVE0P8"}  # strip if LLM leaks old/wrong names
+        auto_classifs = {"CLASSIF_PO_INT", "Partition_Internals", "CLASSIF_PTECO", "EXT_C2C", "INT_C2C", "CLASSIF_PARs_INT", "CLASSIF_WAIVE0P5", "CLASSIF_WAIVE0P8"}  # strip if LLM leaks old/wrong auto-bucket names
         filtered_llm = []
         stripped = 0
         for b in llm_buckets:
@@ -2679,6 +2679,7 @@ def main():
                     f"3. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
                     f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
+                    f"   Use classification CLASSIF_PO_OPT for PO-created buckets. Do NOT use CLASSIF_FCT in PO mode.\n"
                     f"   Do NOT create C2C, EXT, input-port, or PTECO buckets in PO mode.\n"
                     f"5. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
                     f"   Validation automatically includes Python auto-buckets.\n"
