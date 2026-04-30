@@ -2129,7 +2129,92 @@ def validate_buckets(con, buckets, block, run_label, mode, csv_path=None):
 # Auto-buckets (PO_INT + PTECO) created by Python during triage — merged into export
 _auto_buckets_for_export = []
 _last_exported_bucket_path = None
+_last_agent_text = None
 _active_triage_scope = {}
+
+
+def extract_text_blocks(content):
+    """Return plain text concatenated from Anthropic content blocks."""
+    if isinstance(content, str):
+        return content
+
+    parts = []
+    for block in content or []:
+        block_type = getattr(block, "type", None)
+        if block_type is None and isinstance(block, dict):
+            block_type = block.get("type")
+        if block_type != "text":
+            continue
+
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            text = block.get("text")
+        if text:
+            parts.append(text)
+
+    return "\n\n".join(parts).strip()
+
+
+def default_summary_output_path(bucket_path):
+    """Store triage summaries next to the bucket file as Markdown."""
+    base, _ = os.path.splitext(bucket_path)
+    return f"{base}.summary.md"
+
+
+def write_triage_summary(summary_text, summary_path, block, run_label, mode,
+                         persona, partition=None, reports_dir=None,
+                         bucket_path=None, csv_path=None):
+    """Persist the final triage write-up so it survives later runs."""
+    summary_text = (summary_text or "").strip()
+    if not summary_text:
+        return None
+
+    metadata = [
+        f"Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"Persona: {persona}",
+        f"Mode: {mode}",
+    ]
+    if block:
+        metadata.append(f"Block: {block}")
+    if run_label:
+        metadata.append(f"Run: {run_label}")
+    if partition:
+        metadata.append(f"Partition: {partition}")
+    if reports_dir:
+        metadata.append(f"Reports dir: {os.path.abspath(reports_dir)}")
+    if csv_path:
+        metadata.append(f"CSV: {os.path.abspath(csv_path)}")
+    if bucket_path:
+        metadata.append(f"Bucket file: {os.path.abspath(bucket_path)}")
+
+    content = "# STA Agent Triage Summary\n\n"
+    content += "\n".join(f"- {item}" for item in metadata)
+    content += "\n\n## Analysis\n\n"
+    content += f"{summary_text}\n"
+
+    abs_path = os.path.abspath(summary_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return abs_path
+
+
+def format_model_request_error(exc, provider_label):
+    """Map backend/auth failures to actionable user-facing guidance."""
+    message = str(exc)
+    if "invalid_model_endpoint_authentication" in message:
+        return (
+            f"{provider_label} authentication failed while contacting the model backend.\n"
+            "Refresh your GNAI token and export GNAI_API_KEY again, then rerun the command.\n"
+            "If the token was just refreshed, this is likely a transient GNAI/backend issue rather than a triage logic problem.\n"
+            "Request a fresh token at https://gnai.intel.com/auth/oauth2/sso"
+        )
+    if "authentication" in message.lower() and "backend endpoint" in message.lower():
+        return (
+            f"{provider_label} rejected the request while authenticating to the backend endpoint.\n"
+            "Refresh your GNAI token and retry. If the failure persists with a fresh token, treat it as a gateway/backend outage."
+        )
+    return None
 
 
 def handle_tool_call(con, tool_name, tool_input):
@@ -2315,12 +2400,14 @@ def handle_tool_call(con, tool_name, tool_input):
 
 
 def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRECT_MODEL,
-              reports_dir=None, messages=None, max_tokens=4096):
+              reports_dir=None, messages=None, max_tokens=4096, provider_label="model API"):
     """Run the agent loop: question → tool calls → analysis.
     
     If messages is provided, appends to existing conversation (for follow-ups).
     Returns the updated messages list for conversation continuity.
     """
+
+    global _last_agent_text
 
     # Build the user message with optional context
     user_msg = question
@@ -2340,19 +2427,27 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
     if messages is None:
         messages = []
     messages.append({"role": "user", "content": user_msg})
+    _last_agent_text = None
 
     console.print(f"\n[bold]Question:[/bold] {question}\n")
 
     # Agent loop — allow multiple tool calls
     for _ in range(20):  # safety limit
-        with client.messages.stream(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            tools=TOOL_SCHEMA,
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
+        try:
+            with client.messages.stream(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                tools=TOOL_SCHEMA,
+                messages=messages,
+            ) as stream:
+                response = stream.get_final_message()
+        except Exception as exc:
+            friendly_error = format_model_request_error(exc, provider_label)
+            if friendly_error:
+                console.print(f"[red]{friendly_error}[/red]")
+                raise SystemExit(1)
+            raise
 
         # Process response content blocks
         tool_results = []
@@ -2371,6 +2466,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
 
         # If there was text output, display it
         if text_parts:
+            _last_agent_text = extract_text_blocks(response.content)
             console.print()
             for text in text_parts:
                 console.print(Markdown(text))
@@ -2392,7 +2488,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
     return messages
 
 
-def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
+def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None, provider_label="model API"):
     """Interactive REPL mode with conversation history."""
     console.print("[bold]STA Agent[/bold] — Interactive Mode")
     console.print("Type your question, or 'quit' to exit.")
@@ -2415,7 +2511,8 @@ def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None):
             continue
 
         messages = run_agent(con, client, question, model=model,
-                             reports_dir=reports_dir, messages=messages)
+                     reports_dir=reports_dir, messages=messages,
+                     provider_label=provider_label)
 
 
 def main():
@@ -2477,10 +2574,12 @@ def main():
             auth_token=api_key,
         )
         model = GNAI_MODEL
+        provider_label = "Intel GNAI gateway"
         console.print("[dim]Using Intel GNAI gateway[/dim]")
     else:
         client = anthropic.Anthropic(api_key=api_key)
         model = DIRECT_MODEL
+        provider_label = "Anthropic API"
         console.print("[dim]Using direct Anthropic API[/dim]")
 
     try:
@@ -2526,6 +2625,10 @@ def main():
 
             if csv_selection_reason:
                 console.print(f"  [dim]Using {csv_selection_reason}: {csv_path}[/dim]")
+
+            global _last_exported_bucket_path, _last_agent_text
+            _last_exported_bucket_path = None
+            _last_agent_text = None
 
             if args.existing_bucket:
                 try:
@@ -2676,10 +2779,15 @@ def main():
                     f"2. If remaining paths exist, use query_timing_db on the temp view "
                     f"'{triage_data.get('remaining_c2c_ext', {}).get('remaining_view', 'triage_remaining_paths')}' "
                     f"to inspect the raw residual internal partition paths. The remaining_c2c_ext summaries are hints only.\n"
-                    f"3. Classify: ECO (cell sizing), MOP (long net/high fanout), HRP (high logic depth).\n"
+                    f"3. Root-cause labels for PO analysis are still ECO (cell sizing), MOP (long net/high fanout), and HRP (high logic depth).\n"
+                    f"   These are PO issue families, not export classifications. Use them to keep buckets separated by root cause and severity.\n"
                     f"4. For each bucket: filters MUST include StartPin and/or EndPin regex.\n"
                     f"   Do NOT include PathType in filters — it is added automatically.\n"
-                    f"   Use classification CLASSIF_PO_OPT for PO-created buckets. Do NOT use CLASSIF_FCT in PO mode.\n"
+                    f"   Use classification CLASSIF_PO_OPT for every PO-created bucket. Do NOT use CLASSIF_FCT in PO mode.\n"
+                    f"   Classification is uniform in PO mode, but bucket granularity must still reflect distinct issue families, modules, interfaces, and severity bands.\n"
+                    f"   Do NOT merge unrelated root causes into one broad PO_OPT bucket just because they share the same classification.\n"
+                    f"   Keep DFT/test logic, wrapper/interface paths, critical ingress bottlenecks, internal datapath logic, and adapter logic in separate buckets when they are materially different.\n"
+                    f"   For large runs, avoid any single catch-all bucket larger than about 10% of total failing paths unless the remaining residual is truly heterogeneous after targeted bucketing.\n"
                     f"   Do NOT create C2C, EXT, input-port, or PTECO buckets in PO mode.\n"
                     f"5. Call validate_buckets({validate_params}, buckets=<your remaining buckets only>).\n"
                     f"   Validation automatically includes Python auto-buckets.\n"
@@ -2723,9 +2831,23 @@ def main():
                     f"8. Print triage summary: bucket #, classification, path count, worst slack, plus final unmatched count."
                 )
             run_agent(con, client, triage_question, args.block, args.run, args.mode,
-                      model=model, reports_dir=args.reports_dir, max_tokens=32768)
+                      model=model, reports_dir=args.reports_dir, max_tokens=32768,
+                      provider_label=provider_label)
             # Post-triage check: did the bucket file get created?
             actual_path = _last_exported_bucket_path or output_path
+            summary_target = default_summary_output_path(actual_path)
+            saved_summary = write_triage_summary(
+                _last_agent_text,
+                summary_target,
+                block_label,
+                run_label,
+                args.mode,
+                persona,
+                partition=partition,
+                reports_dir=args.reports_dir,
+                bucket_path=actual_path,
+                csv_path=csv_path,
+            )
             if os.path.isfile(actual_path):
                 console.print(f"\n[bold green]\u2713 Bucket file written:[/bold green] {os.path.abspath(actual_path)}")
                 console.print(f"[dim]  Load in Timing Lite: timinglite.py --bucket {os.path.abspath(actual_path)} <report>[/dim]")
@@ -2736,11 +2858,17 @@ def main():
                 console.print(f"\n[bold yellow]\u26a0 Bucket file was NOT created at: {output_path}[/bold yellow]")
                 console.print("[yellow]  The agent may have run out of tokens before reaching the export step.[/yellow]")
                 console.print("[yellow]  Try re-running, or use interactive mode to complete the export.[/yellow]")
+            if saved_summary:
+                console.print(f"[bold green]\u2713 Triage summary saved:[/bold green] {saved_summary}")
+            else:
+                console.print("[bold yellow]\u26a0 Triage summary was not saved because no final assistant summary text was produced.[/bold yellow]")
         elif args.interactive:
-            interactive_mode(con, client, model, reports_dir=args.reports_dir)
+            interactive_mode(con, client, model, reports_dir=args.reports_dir,
+                             provider_label=provider_label)
         elif args.question:
             run_agent(con, client, args.question, args.block, args.run, args.mode,
-                      model=model, reports_dir=args.reports_dir)
+                      model=model, reports_dir=args.reports_dir,
+                      provider_label=provider_label)
         else:
             parser.print_help()
     finally:

@@ -98,6 +98,7 @@ The agent will:
    ```bash
    timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
    ```
+5. Always save the final triage write-up as Markdown next to the bucket output, using the matching `.summary.md` filename.
 
 If you pass `--existing-bucket`, the agent parses the active bucket lines from that file and uses them as the starting STO bucket set for the new run. It keeps buckets that still match, fixes or drops stale ones, and adds new residual buckets as needed. Python still regenerates the auto-buckets for partition internals, EXT, INT_C2C, input ports, and PTECO for the current run.
 
@@ -260,6 +261,7 @@ Raw ad-hoc `query_csv` access sees PSGen's original CSV headers. The pre-ingeste
 ## Token refresh
 
 GNAI tokens expire periodically. Visit https://gnai.intel.com/auth/oauth2/sso to get a fresh one.
+After you generate a new token, re-export `GNAI_API_KEY` in the same shell session before running `agent.py` again. The token does not refresh automatically inside an already-open terminal.
 
 ## VS Code Integration
 
