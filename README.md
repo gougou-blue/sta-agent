@@ -4,20 +4,36 @@ AI-powered CLI for Static Timing Analysis. Ask questions about your PrimeTime re
 
 ## Setup (5 minutes)
 
-```bash
-# 1. Clone
+1. Clone the repo and install dependencies:
+
+```
 git clone https://github.com/gougou-blue/sta-agent.git
 cd sta-agent
-
-# 2. Install dependencies (Python 3.11+)
 python3 -m pip install --user -r requirements.txt
+```
 
-# 3. Get your GNAI token
-#    - Request AGS entitlement: https://goto.intel.com/ags-gnai-public
-#    - Generate token: https://gnai.intel.com/auth/oauth2/sso
-#    (csh)
+2. Get your GNAI token:
+
+- Request AGS entitlement: https://goto.intel.com/ags-gnai-public
+- Generate token: https://gnai.intel.com/auth/oauth2/sso
+
+3. Set the token in the same terminal where you will run the agent. Use the command that matches your terminal.
+
+PowerShell:
+
+```
+$env:GNAI_API_KEY = "your-token-here"
+```
+
+csh / tcsh:
+
+```
 setenv GNAI_API_KEY "your-token-here"
-#    (bash)
+```
+
+sh-compatible terminal:
+
+```
 export GNAI_API_KEY="your-token-here"
 ```
 
@@ -27,7 +43,7 @@ export GNAI_API_KEY="your-token-here"
 
 Point `--reports-dir` at your sta_pt reports directory:
 
-```bash
+```
 python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "analyze worst setup paths and suggest fixes"
 python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "check for timing loops"
 python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "any max transition violations?"
@@ -35,7 +51,7 @@ python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "any max transition 
 
 ### Interactive mode (follow-up questions)
 
-```bash
+```
 python3 agent.py -i --reports-dir /path/to/reports/
 > worst 10 setup paths?
 [... analysis ...]
@@ -50,7 +66,7 @@ python3 agent.py -i --reports-dir /path/to/reports/
 
 For blocks already in the database:
 
-```bash
+```
 python3 agent.py "worst 20 setup paths in d2d4 26ww15.2"
 python3 agent.py "compare d2d4 ww15.2 vs ww14.5 setup — what regressed?"
 python3 agent.py "which clock domains have the most hold violations?"
@@ -61,7 +77,7 @@ python3 agent.py -i   # interactive with pre-ingested data
 
 Auto-bucket failing paths and generate a timinglite-compatible bucket file:
 
-```bash
+```
 # STO mode (default) — focuses on C2C/EXT paths, lumps partition internals
 python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
 python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
@@ -95,7 +111,7 @@ The agent will:
 2. Classify using the IRIS waterfall: Constraints → Feedthrough → Optimization → Additional
 3. Validate bucket coverage — iterate on the unmatched residual paths until unmatched is under 5% of total failing paths
 4. Generate a `.bucket` file you can load directly in Timing Lite:
-   ```bash
+   ```
    timinglite.py --bucket ./buckets/d2d1_26ww14.3_setup.bucket <report>
    ```
 5. Always save the final triage write-up as Markdown next to the bucket output, using the matching `.summary.md` filename.
@@ -122,7 +138,7 @@ Do not force one shared prompt/config for every block in the team. Different des
 
 If a team member only wants to analyze one run or a small number of runs, they do not need to edit the repo at all.
 
-```bash
+```
 python3 agent.py --reports-dir /path/to/my_design/.../reports/ "analyze worst setup paths"
 python3 agent.py --reports-dir /path/to/my_design/.../reports/ -i
 python3 agent.py --triage --reports-dir /path/to/my_design/.../reports/ -m setup
@@ -142,7 +158,7 @@ Important: a design-specific branch does not have to mean hard-coding the block 
 
 1. Clone the repo and create a branch for the design.
 
-```bash
+```
 git clone https://github.com/gougou-blue/sta-agent.git
 cd sta-agent
 git checkout -b my_design_agent
@@ -173,7 +189,7 @@ git checkout -b my_design_agent
 
 4. Ingest is optional. Most teams can skip it unless they want trends, regression comparisons, or persistent historical queries.
 
-```bash
+```
 python3 ingest.py --block my_design
 ```
 
@@ -189,7 +205,7 @@ Good prompt edits are usually small and concrete:
 
 6. Test with normal Q&A first, then triage.
 
-```bash
+```
 python3 agent.py "worst 20 setup paths in my_design 26ww16.1"
 python3 agent.py --triage -b my_design -r 26ww16.1 -m setup
 ```
@@ -261,7 +277,7 @@ Raw ad-hoc `query_csv` access sees PSGen's original CSV headers. The pre-ingeste
 ## Token refresh
 
 GNAI tokens expire periodically. Visit https://gnai.intel.com/auth/oauth2/sso to get a fresh one.
-After you generate a new token, re-export `GNAI_API_KEY` in the same shell session before running `agent.py` again. The token does not refresh automatically inside an already-open terminal.
+After you generate a new token, set `GNAI_API_KEY` again in the same terminal session before running `agent.py`. The token does not refresh automatically inside an already-open terminal.
 
 ## VS Code Integration
 
@@ -276,14 +292,14 @@ Run the agent directly from VS Code without leaving the editor:
    - **STA Agent: Interactive Mode** — starts the interactive REPL in the terminal
    - **STA Agent: Analyze Reports Dir** — prompts for an NFS reports path, then starts interactive mode
 
-Make sure `GNAI_API_KEY` is set in your shell/environment before launching VS Code.
+Make sure `GNAI_API_KEY` is set in your terminal or environment before launching VS Code.
 
 ### Option 2: MCP Server (Copilot Chat integration)
 
 Ask STA questions directly in GitHub Copilot Chat — no terminal needed:
 
 1. Install the MCP dependency:
-   ```bash
+   ```
    pip install mcp
    ```
 
