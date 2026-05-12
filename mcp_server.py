@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-STA Agent MCP Server — expose STA tools to VS Code Copilot Chat.
+PathMind MCP Server — expose timing analysis tools to VS Code Copilot Chat.
 
 Runs as a Model Context Protocol (MCP) stdio server. Copilot Chat can call
 query_timing_db, query_csv, list_available_data, list_reports, and read_report
@@ -16,10 +16,10 @@ import sys
 import duckdb
 from mcp.server.fastmcp import FastMCP
 
-# Add parent dir so we can import from the agent
+# Add parent dir so we can import from PathMind
 sys.path.insert(0, os.path.dirname(__file__))
 from config import BLOCKS, DB_PATH
-from agent import (
+from pathmind import (
     execute_query,
     list_data,
     list_report_files,
@@ -31,8 +31,8 @@ from agent import (
 )
 
 mcp = FastMCP(
-    "sta-agent",
-    description="AI-powered Static Timing Analysis — query timing databases, read PrimeTime reports, and analyze violations",
+    "pathmind",
+    description="PathMind — query timing databases, read PrimeTime reports, and analyze violations",
 )
 
 # ---------- database connection (lazy, read-only) ----------

@@ -1,6 +1,6 @@
 {
     "servers": {
-        "sta-agent": {
+        "pathmind": {
             "type": "stdio",
             "command": "python3",
             "args": ["mcp_server.py"],

@@ -1,6 +1,6 @@
-# STA Agent
+# PathMind
 
-AI-powered CLI for Static Timing Analysis. Ask questions about your PrimeTime reports in plain English — get analysis, root causes, and fix recommendations.
+AI-assisted timing path analysis and triage. Ask questions about your PrimeTime reports in plain English — get analysis, root causes, and fix recommendations.
 
 ## Setup (5 minutes)
 
@@ -17,7 +17,7 @@ python3 -m pip install --user -r requirements.txt
 - Request AGS entitlement: https://goto.intel.com/ags-gnai-public
 - Generate token: https://gnai.intel.com/auth/oauth2/sso
 
-3. Set the token in the same terminal where you will run the agent. Use the command that matches your terminal.
+3. Set the token in the same terminal where you will run PathMind. Use the command that matches your terminal.
 
 PowerShell:
 
@@ -44,15 +44,15 @@ export GNAI_API_KEY="your-token-here"
 Point `--reports-dir` at your sta_pt reports directory:
 
 ```
-python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "analyze worst setup paths and suggest fixes"
-python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "check for timing loops"
-python3 agent.py --reports-dir /path/to/sta_pt/.../reports/ "any max transition violations?"
+python3 pathmind.py --reports-dir /path/to/sta_pt/.../reports/ "analyze worst setup paths and suggest fixes"
+python3 pathmind.py --reports-dir /path/to/sta_pt/.../reports/ "check for timing loops"
+python3 pathmind.py --reports-dir /path/to/sta_pt/.../reports/ "any max transition violations?"
 ```
 
 ### Interactive mode (follow-up questions)
 
 ```
-python3 agent.py -i --reports-dir /path/to/reports/
+python3 pathmind.py -i --reports-dir /path/to/reports/
 > worst 10 setup paths?
 [... analysis ...]
 > does the PHY from our previous project have the same issue?
@@ -67,10 +67,10 @@ python3 agent.py -i --reports-dir /path/to/reports/
 For blocks already in the database:
 
 ```
-python3 agent.py "worst 20 setup paths in d2d4 26ww15.2"
-python3 agent.py "compare d2d4 ww15.2 vs ww14.5 setup — what regressed?"
-python3 agent.py "which clock domains have the most hold violations?"
-python3 agent.py -i   # interactive with pre-ingested data
+python3 pathmind.py "worst 20 setup paths in d2d4 26ww15.2"
+python3 pathmind.py "compare d2d4 ww15.2 vs ww14.5 setup — what regressed?"
+python3 pathmind.py "which clock domains have the most hold violations?"
+python3 pathmind.py -i   # interactive with pre-ingested data
 ```
 
 ### Triage a timing run
@@ -79,22 +79,22 @@ Auto-bucket failing paths and generate a timinglite-compatible bucket file:
 
 ```
 # STO mode (default) — focuses on C2C/EXT paths, lumps partition internals
-python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup
-python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
+python3 pathmind.py --triage -b d2d1 -r 26ww14.3 -m setup
+python3 pathmind.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup
 
 # Enable milestone-specific waiver buckets
-python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --milestone 0p5
-python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m hold --milestone 0p8
+python3 pathmind.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --milestone 0p5
+python3 pathmind.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m hold --milestone 0p8
 
 # PO mode — drills into a specific partition's internal paths
-python3 agent.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m setup
-python3 agent.py --triage --persona po -p pard2d1uladda1 --reports-dir /path/to/sta_pt/.../reports/ -m setup
+python3 pathmind.py --triage --persona po -p pard2d1uladda1 -b d2d1 -r 26ww14.3 -m setup
+python3 pathmind.py --triage --persona po -p pard2d1uladda1 --reports-dir /path/to/sta_pt/.../reports/ -m setup
 
 # Specify output path
-python3 agent.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
+python3 pathmind.py --triage -b d2d1 -r 26ww14.3 -m setup -o /nfs/.../d2d1_setup.bucket
 
 # Update an existing STO bucket file for a new run
-python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --existing-bucket ./buckets/d2d1_setup.bucket -o ./buckets/d2d1_setup_updated.bucket
+python3 pathmind.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --existing-bucket ./buckets/d2d1_setup.bucket -o ./buckets/d2d1_setup_updated.bucket
 ```
 
 **Persona modes:**
@@ -104,9 +104,9 @@ python3 agent.py --triage --reports-dir /path/to/sta_pt/.../reports/ -m setup --
 | `--persona po -p <partition>` | Partition Owner | Internal paths within the selected partition only; detailed sub-buckets by logic cone, severity, FC recipe |
 
 PO mode scopes triage to failing paths whose startpoint and endpoint both resolve to the selected partition. It excludes STO-owned C2C, EXT, input-port, and PTECO paths from the PO bucket file.
-When you use `--reports-dir` in PO mode, the agent requires a partition-specific summary CSV like `pard2d4uladda1.func.max_nom.TT_100.tttt.report_summary.max.csv.gz`. If that partition report is missing, PO triage fails with a report-not-found error.
+When you use `--reports-dir` in PO mode, PathMind requires a partition-specific summary CSV like `pard2d4uladda1.func.max_nom.TT_100.tttt.report_summary.max.csv.gz`. If that partition report is missing, PO triage fails with a report-not-found error.
 
-The agent will:
+PathMind will:
 1. Analyze all failing paths grouped by clock domain, partition, path type, and severity
 2. Classify using the IRIS waterfall: Constraints → Feedthrough → Optimization → Additional
 3. Validate bucket coverage — iterate on the unmatched residual paths until unmatched is under 5% of total failing paths
@@ -116,7 +116,7 @@ The agent will:
    ```
 5. Always save the final triage write-up as Markdown next to the bucket output, using the matching `.summary.md` filename.
 
-If you pass `--existing-bucket`, the agent parses the active bucket lines from that file and uses them as the starting STO bucket set for the new run. It keeps buckets that still match, fixes or drops stale ones, and adds new residual buckets as needed. Python still regenerates the auto-buckets for partition internals, EXT, INT_C2C, input ports, and PTECO for the current run.
+If you pass `--existing-bucket`, PathMind parses the active bucket lines from that file and uses them as the starting STO bucket set for the new run. It keeps buckets that still match, fixes or drops stale ones, and adds new residual buckets as needed. Python still regenerates the auto-buckets for partition internals, EXT, INT_C2C, input ports, and PTECO for the current run.
 
 If you pass `--milestone`, Python can also auto-create a milestone waiver bucket before LLM triage:
 - `0p5` setup uses `PercentPeriod:>-20`; `0p5` hold uses `Slack:>-100`
@@ -139,9 +139,9 @@ Do not force one shared prompt/config for every block in the team. Different des
 If a team member only wants to analyze one run or a small number of runs, they do not need to edit the repo at all.
 
 ```
-python3 agent.py --reports-dir /path/to/my_design/.../reports/ "analyze worst setup paths"
-python3 agent.py --reports-dir /path/to/my_design/.../reports/ -i
-python3 agent.py --triage --reports-dir /path/to/my_design/.../reports/ -m setup
+python3 pathmind.py --reports-dir /path/to/my_design/.../reports/ "analyze worst setup paths"
+python3 pathmind.py --reports-dir /path/to/my_design/.../reports/ -i
+python3 pathmind.py --triage --reports-dir /path/to/my_design/.../reports/ -m setup
 ```
 
 Use this path when:
@@ -150,18 +150,18 @@ Use this path when:
 - You do not need run-to-run comparisons or historical trends.
 - You want to test whether the prompt understands your report content before customizing anything.
 
-### Path 2: design-specific agent variant
+### Path 2: design-specific PathMind variant
 
 Use this when a design has stable naming conventions and repeated triage needs.
 
-Important: a design-specific branch does not have to mean hard-coding the block into the shared agent. For many teams, the branch is mainly for prompt tuning and local examples while day-to-day analysis still uses `--reports-dir`.
+Important: a design-specific branch does not have to mean hard-coding the block into the shared tool. For many teams, the branch is mainly for prompt tuning and local examples while day-to-day analysis still uses `--reports-dir`.
 
 1. Clone the repo and create a branch for the design.
 
 ```
 git clone https://github.com/gougou-blue/sta-agent.git
 cd sta-agent
-git checkout -b my_design_agent
+git checkout -b my_design_pathmind
 ```
 
 2. Only add the design to `config.py` if you want named runs, persistent shortcuts, or pre-defined hierarchy controls for that design.
@@ -206,8 +206,8 @@ Good prompt edits are usually small and concrete:
 6. Test with normal Q&A first, then triage.
 
 ```
-python3 agent.py "worst 20 setup paths in my_design 26ww16.1"
-python3 agent.py --triage -b my_design -r 26ww16.1 -m setup
+python3 pathmind.py "worst 20 setup paths in my_design 26ww16.1"
+python3 pathmind.py --triage -b my_design -r 26ww16.1 -m setup
 ```
 
 7. Keep the variant local to the design team unless the tuning is clearly generic.
@@ -230,7 +230,7 @@ python3 agent.py --triage -b my_design -r 26ww16.1 -m setup
 
 ### Usually not needed at first
 
-- `agent.py`: only change code when the design exposes a real structural difference in the data model or bucket logic.
+- `pathmind.py`: only change code when the design exposes a real structural difference in the data model or bucket logic.
 
 ## Branch policy
 
@@ -244,7 +244,7 @@ python3 agent.py --triage -b my_design -r 26ww16.1 -m setup
 
 1. Pick one design owner and one active run.
 2. Start with `--reports-dir` and collect a few successful queries.
-3. If the agent is useful, create a design branch and tune `prompts/system.txt` for the naming patterns that matter in that design.
+3. If PathMind is useful, create a design branch and tune `prompts/system.txt` for the naming patterns that matter in that design.
 4. Add `config.py` entries only if the design wants stable named runs or built-in hierarchy defaults.
 5. Only merge code changes back to the shared repo if they are generic across multiple designs.
 
@@ -266,31 +266,34 @@ The CLI and validation loop can be common. The design-specific pieces should sta
 ## Architecture
 
 ```
-agent.py            — CLI: question → Claude → SQL/reports → analysis
+pathmind.py         — CLI: question → Claude → SQL/reports → analysis
+agent.py            — Compatibility wrapper for existing commands
 config.py           — Block/run configuration (for pre-ingested data)
 ingest.py           — Parse sta_pt CSV.gz → DuckDB (optional)
 prompts/system.txt  — STA domain knowledge and analysis guidelines
 ```
+
+`agent.py` is kept as a compatibility wrapper during the PathMind transition. New examples use `pathmind.py`.
 
 Raw ad-hoc `query_csv` access sees PSGen's original CSV headers. The pre-ingested DuckDB `paths` table uses normalized names like `startpoint`, `endpoint`, `launch_clock`, and `capture_clock`, but direct CSV queries often need PSGen names such as `start_pin`, `end_pin`, `start_clock`, `end_clock`, and `path_delay_type` unless you alias them in SQL.
 
 ## Token refresh
 
 GNAI tokens expire periodically. Visit https://gnai.intel.com/auth/oauth2/sso to get a fresh one.
-After you generate a new token, set `GNAI_API_KEY` again in the same terminal session before running `agent.py`. The token does not refresh automatically inside an already-open terminal.
+After you generate a new token, set `GNAI_API_KEY` again in the same terminal session before running `pathmind.py`. The token does not refresh automatically inside an already-open terminal.
 
 ## VS Code Integration
 
 ### Option 1: VS Code Tasks (quick start)
 
-Run the agent directly from VS Code without leaving the editor:
+Run PathMind directly from VS Code without leaving the editor:
 
 1. Open the sta-agent folder in VS Code
 2. Press `Ctrl+Shift+P` → **Tasks: Run Task**
 3. Pick one:
-   - **STA Agent: Ask Question** — prompts for a one-shot question
-   - **STA Agent: Interactive Mode** — starts the interactive REPL in the terminal
-   - **STA Agent: Analyze Reports Dir** — prompts for an NFS reports path, then starts interactive mode
+   - **PathMind: Ask Question** — prompts for a one-shot question
+   - **PathMind: Interactive Mode** — starts the interactive REPL in the terminal
+   - **PathMind: Analyze Reports Dir** — prompts for an NFS reports path, then starts interactive mode
 
 Make sure `GNAI_API_KEY` is set in your terminal or environment before launching VS Code.
 

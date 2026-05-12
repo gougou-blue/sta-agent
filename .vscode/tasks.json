@@ -2,11 +2,11 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "STA Agent: Ask Question",
+            "label": "PathMind: Ask Question",
             "type": "shell",
             "command": "python3",
             "args": [
-                "agent.py",
+                "pathmind.py",
                 "${input:staQuestion}"
             ],
             "options": {
@@ -21,11 +21,11 @@
             "problemMatcher": []
         },
         {
-            "label": "STA Agent: Interactive Mode",
+            "label": "PathMind: Interactive Mode",
             "type": "shell",
             "command": "python3",
             "args": [
-                "agent.py",
+                "pathmind.py",
                 "--interactive"
             ],
             "options": {
@@ -41,11 +41,11 @@
             "problemMatcher": []
         },
         {
-            "label": "STA Agent: Analyze Reports Dir",
+            "label": "PathMind: Analyze Reports Dir",
             "type": "shell",
             "command": "python3",
             "args": [
-                "agent.py",
+                "pathmind.py",
                 "--interactive",
                 "--reports-dir",
                 "${input:reportsDir}"

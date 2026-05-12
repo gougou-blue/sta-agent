@@ -1,5 +1,5 @@
 """
-Block and run configuration for STA Agent.
+Block and run configuration for PathMind.
 Mirrors the dashboard's backend/config.js — same CSV paths.
 """
 
