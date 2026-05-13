@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-PathMind — AI-assisted timing path analysis CLI.
+STA Agent — AI-powered STA analysis CLI.
 
 Uses Claude (via Intel GNAI gateway) to translate natural language questions
 into SQL queries against a DuckDB database of STA timing paths, then
 analyzes the results.
 
 Usage:
-    python pathmind.py "top 10 worst setup paths in d2d1"
-    python pathmind.py "compare d2d4 ww15.2 vs ww14.5 setup"
-    python pathmind.py --interactive
-    python pathmind.py --block d2d1 --run 26ww14.3 --mode setup "worst paths and suggest fixes"
+    python agent.py "top 10 worst setup paths in d2d1"
+    python agent.py "compare d2d4 ww15.2 vs ww14.5 setup"
+    python agent.py --interactive
+    python agent.py --block d2d1 --run 26ww14.3 --mode setup "worst paths and suggest fixes"
 
 Environment:
     GNAI_API_KEY        — required, your GNAI API key
@@ -2187,7 +2187,7 @@ def write_triage_summary(summary_text, summary_path, block, run_label, mode,
     if bucket_path:
         metadata.append(f"Bucket file: {os.path.abspath(bucket_path)}")
 
-    content = "# PathMind Triage Summary\n\n"
+    content = "# STA Agent Triage Summary\n\n"
     content += "\n".join(f"- {item}" for item in metadata)
     content += "\n\n## Analysis\n\n"
     content += f"{summary_text}\n"
@@ -2373,7 +2373,7 @@ def handle_tool_call(con, tool_name, tool_input):
             pct = result["unmatched_pct"]
             status = "[bold green]PASS[/bold green]" if result["meets_target"] else "[bold red]FAIL[/bold red]"
             console.print(f"  Coverage: {matched}/{total} paths matched ({100-pct:.1f}%)")
-            console.print(f"  Unmatched: {unmatched} paths ({pct}%) - target <5% - {status}")
+            console.print(f"  Unmatched: {unmatched} paths ({pct}%) — target <5% — {status}")
         else:
             console.print(f"[red]{result['error']}[/red]")
         return json.dumps(result, default=str)
@@ -2490,7 +2490,7 @@ def run_agent(con, client, question, block=None, run=None, mode=None, model=DIRE
 
 def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None, provider_label="model API"):
     """Interactive REPL mode with conversation history."""
-    console.print("[bold]PathMind[/bold] - Interactive Mode")
+    console.print("[bold]STA Agent[/bold] — Interactive Mode")
     console.print("Type your question, or 'quit' to exit.")
     console.print("[dim]Follow-up questions remember previous context. Type 'reset' to clear history.[/dim]\n")
 
@@ -2517,13 +2517,13 @@ def interactive_mode(con, client, model=DIRECT_MODEL, reports_dir=None, provider
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PathMind - AI-assisted timing path analysis and triage",
+        description="STA Agent — AI-powered timing analysis",
         epilog="Examples:\n"
-               "  python pathmind.py 'top 10 worst setup paths in d2d1'\n"
-               "  python pathmind.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
-               "  python pathmind.py --triage -b d2d1 -r 26ww14.3 -m setup\n"
-               "  python pathmind.py --triage --reports-dir /path/to/reports -m setup --existing-bucket ./buckets/d2d1_setup.bucket\n"
-               "  python pathmind.py -i\n",
+               "  python agent.py 'top 10 worst setup paths in d2d1'\n"
+               "  python agent.py --reports-dir /path/to/reports 'analyze worst setup paths'\n"
+               "  python agent.py --triage -b d2d1 -r 26ww14.3 -m setup\n"
+             "  python agent.py --triage --reports-dir /path/to/reports -m setup --existing-bucket ./buckets/d2d1_setup.bucket\n"
+               "  python agent.py -i\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("question", nargs="?", help="Question to ask (or use --interactive)")

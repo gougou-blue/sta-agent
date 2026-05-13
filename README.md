@@ -266,14 +266,14 @@ The CLI and validation loop can be common. The design-specific pieces should sta
 ## Architecture
 
 ```
-pathmind.py         — CLI: question → Claude → SQL/reports → analysis
-agent.py            — Compatibility wrapper for existing commands
+agent.py            — Golden CLI: question → Claude → SQL/reports → analysis
+pathmind.py         — Identical PathMind entrypoint copied from agent.py
 config.py           — Block/run configuration (for pre-ingested data)
 ingest.py           — Parse sta_pt CSV.gz → DuckDB (optional)
 prompts/system.txt  — STA domain knowledge and analysis guidelines
 ```
 
-`agent.py` is kept as a compatibility wrapper during the PathMind transition. New examples use `pathmind.py`.
+`agent.py` remains the golden original during the PathMind transition. `pathmind.py` is kept as an exact copy so existing `agent.py` users are not disturbed while new examples can use `pathmind.py`.
 
 Raw ad-hoc `query_csv` access sees PSGen's original CSV headers. The pre-ingested DuckDB `paths` table uses normalized names like `startpoint`, `endpoint`, `launch_clock`, and `capture_clock`, but direct CSV queries often need PSGen names such as `start_pin`, `end_pin`, `start_clock`, `end_clock`, and `path_delay_type` unless you alias them in SQL.
 
