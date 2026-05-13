@@ -573,7 +573,16 @@ def get_reports_dir(block, run_label, mode):
                 return os.path.dirname(csv_path)
     return None
 
-def resolve_triage_csv_path(reports_dir, mode, persona="sto", partition=None):
+def infer_run_block_from_reports_dir(reports_dir):
+    """Infer the run block from a path containing runs/<block>/.../reports."""
+    parts = re.split(r"[\\/]+", os.path.normpath(reports_dir))
+    for index, part in enumerate(parts):
+        if part == "runs" and index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def resolve_triage_csv_path(reports_dir, mode, persona="sto", partition=None, block=None):
     """Resolve the CSV to use for ad-hoc triage from a reports directory or direct file path.
 
     In PO mode, require a partition-specific report such as
@@ -619,6 +628,19 @@ def resolve_triage_csv_path(reports_dir, mode, persona="sto", partition=None):
                 f"Expected a file matching {partition}.*.{suffix_base}[.gz]"
             ),
         }
+
+    run_block = block or infer_run_block_from_reports_dir(reports_dir)
+    if run_block:
+        block_prefixes = [f"{run_block}.", f"{run_block}_"]
+        preferred = [
+            f for f in candidates
+            if any(f.startswith(prefix) for prefix in block_prefixes)
+        ]
+        if preferred:
+            return {
+                "csv_path": os.path.join(reports_dir, preferred[0]),
+                "selection_reason": f"block-level report for {run_block}",
+            }
 
     return {
         "csv_path": os.path.join(reports_dir, candidates[0]),
@@ -2605,6 +2627,7 @@ def main():
                     args.mode,
                     persona=persona,
                     partition=partition,
+                    block=args.block,
                 )
                 if "error" in resolved:
                     console.print(f"[red]{resolved['error']}[/red]")
