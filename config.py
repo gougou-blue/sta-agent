@@ -43,6 +43,22 @@ BLOCKS = {
     },
     "uio_a_0": {
         "owner": "pavanmku",
+        "leaf_depth": 2,
+        "leaf_partitions_n1": [
+            "parmioasf_uio_0",
+            "parmiohap_uio_0",
+            "parmioiommu_uio_0",
+            "parmioitc_uio_0",
+            "parmiocpc_uio_0",
+            "parmiomisc_uio_0",
+            "parmiootc_uio_0",
+            "parmiopcie6trcore_uio_0",
+            "parmiopcie6tridelldp_uio_0",
+            "parmiopcie6ttcore_uio_0",
+            "parmiopcie6ttidecee_uio_0",
+            "parmiostaticmux_uio_0",
+            "parmioula_uio_0",
+        ],
         "runs": [
             {
                 "label": "RTL13A_26ww15.1",
